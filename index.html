@@ -1,0 +1,592 @@
+<meta charset="utf-8">
+<title>Elbow X-ray viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --panel-2: #1c2128;
+    --line: #2b323b;
+    --ink: #e6e9ed;
+    --ink-dim: #97a1ad;
+    --accent: #ffcc00;
+    --danger: #ff6b5e;
+    --tap: 44px;
+    --safe-l: env(safe-area-inset-left, 0px);
+    --safe-r: env(safe-area-inset-right, 0px);
+    --safe-t: env(safe-area-inset-top, 0px);
+    --safe-b: env(safe-area-inset-bottom, 0px);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    height: 100%; margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overscroll-behavior: none;
+  }
+  body { display: flex; flex-direction: column; padding: var(--safe-t) var(--safe-r) var(--safe-b) var(--safe-l); }
+
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0 6px 0 0; letter-spacing: .01em; }
+
+  button, .btn {
+    min-height: var(--tap); min-width: var(--tap);
+    padding: 0 14px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel-2); color: var(--ink); font: inherit; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  button:active { background: #262d36; }
+  button[aria-pressed="true"] { background: var(--accent); color: #14181d; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .4; }
+
+  #views { display: flex; gap: 6px; overflow-x: auto; padding: 6px 12px; border-bottom: 1px solid var(--line); }
+  #views button { white-space: nowrap; }
+
+  #stage { position: relative; flex: 1 1 auto; min-height: 0; background: #000; overflow: hidden; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
+  #empty {
+    position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px;
+    align-items: center; justify-content: center; text-align: center; padding: 24px; color: var(--ink-dim);
+  }
+  #err {
+    position: absolute; left: 12px; right: 12px; top: 12px; padding: 10px 12px;
+    background: #3a1d1b; border: 1px solid var(--danger); border-radius: 10px;
+    color: #ffd9d5; font-size: 13px; white-space: pre-wrap; display: none;
+  }
+
+  #controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px;
+    padding: 10px 12px; border-top: 1px solid var(--line); background: var(--panel);
+  }
+  .slider { display: flex; align-items: center; gap: 8px; flex: 1 1 200px; min-width: 180px; }
+  .slider label { color: var(--ink-dim); font-size: 13px; white-space: nowrap; }
+  input[type=range] { flex: 1 1 auto; min-width: 90px; height: var(--tap); accent-color: var(--accent); }
+  .group { display: flex; gap: 6px; align-items: center; }
+  #status { flex: 1 1 100%; color: var(--ink-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .hide { display: none !important; }
+</style>
+
+<header>
+  <h1>Elbow X-ray</h1>
+  <button id="open">Open files</button>
+  <button id="clear">Clear</button>
+  <input id="file" type="file" multiple accept=".dcm,.dicom,.ima,application/dicom" hidden>
+</header>
+
+<div id="views"></div>
+
+<div id="stage">
+  <canvas id="canvas"></canvas>
+  <div id="empty">
+    <div>No X-rays loaded.</div>
+    <div style="font-size:13px">Tap <strong>Open files</strong> and pick your <code>.dcm</code> files.</div>
+  </div>
+  <div id="err"></div>
+</div>
+
+<div id="controls">
+  <div class="slider"><label for="brightness">Brightness</label><input id="brightness" type="range" min="0" max="1" value="0"></div>
+  <div class="slider"><label for="contrast">Contrast</label><input id="contrast" type="range" min="0" max="1" value="0"></div>
+  <div class="group">
+    <button id="invert" aria-pressed="false">Invert</button>
+    <input id="strength" type="range" min="0" max="100" value="100" style="max-width:110px" disabled>
+    <span id="strengthValue" style="color:var(--ink-dim);font-size:13px;min-width:38px">100%</span>
+  </div>
+  <div class="group">
+    <button id="distance" aria-pressed="false">Distance</button>
+    <button id="angle" aria-pressed="false">Angle</button>
+    <button id="clearMeasure">Clear marks</button>
+    <button id="resetWindow">Reset window</button>
+    <button id="fit">Fit</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<script src="viewer-core.js"></script>
+<script>
+(function () {
+  "use strict";
+  var XV = globalThis.XV;
+
+  var MODE_NONE = "none", MODE_DISTANCE = "distance", MODE_ANGLE = "angle";
+  var INVERT_STRENGTH_DEFAULT = 100;
+  var TAP_SLOP_PX = 10;      // a drag longer than this is a pan, not a point
+  var TAP_MAX_MS = 600;
+
+  var el = function (id) { return document.getElementById(id); };
+  var stage = el("stage"), canvas = el("canvas"), ctx = canvas.getContext("2d");
+  var errBox = el("err"), emptyBox = el("empty"), statusBox = el("status"), viewsBox = el("views");
+
+  var films = [];            // parsed radiographs
+  var current = -1;
+  var levels = [];           // per-film [lo, hi], survives switching films
+  var mode = MODE_NONE;
+  var pending = [];          // measurement points awaiting the full set
+  var marks = [];            // {points, text} already placed, per film index
+  var invertOn = false, invertStrength = INVERT_STRENGTH_DEFAULT;
+  var xform = { scale: 1, tx: 0, ty: 0 };
+  var greyCanvas = document.createElement("canvas");
+  var greyCtx = greyCanvas.getContext("2d");
+  var greyDirty = true;
+  var frameQueued = false;
+
+  // ------------------------------------------------------------ IndexedDB
+  // Raw file blobs only: parsing is cheap enough to redo on launch, and storing the
+  // bytes means a re-parse always agrees with a fresh Open of the same file.
+  var DB_NAME = "xray-ipad", DB_STORE = "files", DB_VERSION = 1;
+
+  function openDb() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = function () {
+        if (!req.result.objectStoreNames.contains(DB_STORE)) req.result.createObjectStore(DB_STORE);
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+
+  function dbTx(mode, run) {
+    return openDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(DB_STORE, mode);
+        var out = run(tx.objectStore(DB_STORE));
+        tx.oncomplete = function () { resolve(out && out.result !== undefined ? out.result : out); };
+        tx.onerror = function () { reject(tx.error); };
+      });
+    });
+  }
+
+  function storeFiles(fileList) {
+    return dbTx("readwrite", function (store) {
+      for (var i = 0; i < fileList.length; i++) store.put(fileList[i], fileList[i].name);
+    });
+  }
+
+  function loadStoredFiles() {
+    return dbTx("readonly", function (store) { return store.getAll(); }).catch(function () { return []; });
+  }
+
+  function clearStore() {
+    return dbTx("readwrite", function (store) { store.clear(); });
+  }
+
+  // Asked once; Safari decides. Without it a home-screen app's files can be evicted.
+  function requestPersistence() {
+    try {
+      if (localStorage.getItem("xv-persist-asked")) return;
+      localStorage.setItem("xv-persist-asked", "1");
+      if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+    } catch (e) { /* private browsing: storage APIs throw, nothing here is essential */ }
+  }
+
+  // --------------------------------------------------------------- loading
+  function showError(text) {
+    errBox.textContent = text;
+    errBox.style.display = text ? "block" : "none";
+  }
+
+  function ingest(fileObjects) {
+    var problems = [];
+    var jobs = Array.prototype.map.call(fileObjects, function (f) {
+      return f.arrayBuffer().then(function (buf) {
+        try { return XV.parseDicom(buf, f.name); }
+        catch (e) { problems.push(f.name + ": " + e.message); return null; }
+      });
+    });
+    return Promise.all(jobs).then(function (parsed) {
+      var loaded = parsed.filter(Boolean);
+      loaded.sort(function (a, b) { return a.name.localeCompare(b.name); });
+      films = XV.applyGenericLabels(loaded);
+      levels = films.map(function (f) { return f.windowRange.slice(); });
+      marks = films.map(function () { return []; });
+      showError(problems.length ? problems.join("\n") : "");
+      renderViews();
+      if (films.length) select(0); else { current = -1; emptyBox.classList.remove("hide"); draw(); }
+      return films.length;
+    });
+  }
+
+  function renderViews() {
+    viewsBox.innerHTML = "";
+    films.forEach(function (f, i) {
+      var b = document.createElement("button");
+      b.textContent = f.label || f.name;
+      b.setAttribute("aria-pressed", String(i === current));
+      b.onclick = function () { select(i); };
+      viewsBox.appendChild(b);
+    });
+  }
+
+  function select(index) {
+    if (index < 0 || index >= films.length) return;
+    current = index;
+    cancelMeasurement();
+    emptyBox.classList.add("hide");
+    syncSliders();
+    greyDirty = true;
+    fitToStage();
+    Array.prototype.forEach.call(viewsBox.children, function (b, i) {
+      b.setAttribute("aria-pressed", String(i === current));
+    });
+    updateStatus();
+  }
+
+  function film() { return films[current]; }
+
+  // ------------------------------------------------------------- windowing
+  function syncSliders() {
+    var f = film();
+    if (!f) return;
+    var bounds = XV.windowBounds(f.pixels);
+    var w = XV.windowFromLevels(levels[current]);
+    var brightness = el("brightness"), contrast = el("contrast");
+    brightness.min = bounds.levelMin; brightness.max = bounds.levelMax;
+    brightness.value = String(Math.round(Math.min(Math.max(w.center, bounds.levelMin), bounds.levelMax)));
+    contrast.min = bounds.widthMin; contrast.max = bounds.widthMax;
+    // Qt's setInvertedAppearance(True): right = narrower window = more contrast.
+    var width = Math.round(Math.min(Math.max(w.width, bounds.widthMin), bounds.widthMax));
+    contrast.value = String(bounds.widthMin + bounds.widthMax - width);
+  }
+
+  function widthFromSlider() {
+    var contrast = el("contrast");
+    return Number(contrast.min) + Number(contrast.max) - Number(contrast.value);
+  }
+
+  function onWindowSlider() {
+    if (!film()) return;
+    levels[current] = XV.levelsFromWindow(Number(el("brightness").value), widthFromSlider());
+    greyDirty = true;
+    requestDraw();
+    updateStatus();
+  }
+
+  function resetWindow() {
+    if (!film()) return;
+    levels[current] = film().windowRange.slice();
+    syncSliders();
+    greyDirty = true;
+    requestDraw();
+    updateStatus();
+  }
+
+  // --------------------------------------------------------------- drawing
+  function rebuildGrey() {
+    var f = film();
+    if (!f) return;
+    greyCanvas.width = f.cols;
+    greyCanvas.height = f.rows;
+    var lo = levels[current][0], hi = levels[current][1];
+    var span = hi - lo;
+    if (span <= 0) span = 1;
+    var lut = XV.blendLut(invertOn ? invertStrength / 100 : 0);
+
+    // One table over the whole 16-bit range, then a straight lookup per pixel: the
+    // per-pixel work stays a single array read even on a 5-megapixel film.
+    var table = new Uint8Array(65536);
+    for (var v = 0; v < 65536; v++) {
+      var t = ((v - lo) / span) * 255;
+      table[v] = lut[t < 0 ? 0 : t > 255 ? 255 : Math.round(t)];
+    }
+    var image = greyCtx.createImageData(f.cols, f.rows);
+    var out = image.data;
+    var px = f.pixels;
+    for (var i = 0, j = 0; i < px.length; i++, j += 4) {
+      var g = table[px[i]];
+      out[j] = g; out[j + 1] = g; out[j + 2] = g; out[j + 3] = 255;
+    }
+    greyCtx.putImageData(image, 0, 0);
+    greyDirty = false;
+  }
+
+  function fitToStage() {
+    var f = film();
+    if (!f) return;
+    var w = canvas.width, h = canvas.height;
+    var scale = Math.min(w / f.cols, h / f.rows);
+    xform.scale = scale;
+    xform.tx = (w - f.cols * scale) / 2;
+    xform.ty = (h - f.rows * scale) / 2;
+    requestDraw();
+  }
+
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var r = stage.getBoundingClientRect();
+    var w = Math.max(1, Math.round(r.width * dpr));
+    var h = Math.max(1, Math.round(r.height * dpr));
+    if (canvas.width === w && canvas.height === h) return;
+    var hadFilm = !!film();
+    canvas.width = w; canvas.height = h;
+    if (hadFilm) fitToStage(); else requestDraw();
+  }
+
+  function requestDraw() {
+    if (frameQueued) return;
+    frameQueued = true;
+    requestAnimationFrame(function () { frameQueued = false; draw(); });
+  }
+
+  function draw() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    var f = film();
+    if (!f) return;
+    if (greyDirty) rebuildGrey();
+    ctx.imageSmoothingEnabled = xform.scale < 1;
+    ctx.setTransform(xform.scale, 0, 0, xform.scale, xform.tx, xform.ty);
+    ctx.drawImage(greyCanvas, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    drawMarks();
+  }
+
+  function toScreen(p) {
+    return [p[0] * xform.scale + xform.tx, p[1] * xform.scale + xform.ty];
+  }
+
+  function drawPolyline(points, withText) {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    ctx.strokeStyle = "#ffcc00";
+    ctx.fillStyle = "#ffcc00";
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    points.forEach(function (p, i) {
+      var s = toScreen(p);
+      if (i === 0) ctx.moveTo(s[0], s[1]); else ctx.lineTo(s[0], s[1]);
+    });
+    ctx.stroke();
+    points.forEach(function (p) {
+      var s = toScreen(p);
+      ctx.beginPath();
+      ctx.arc(s[0], s[1], 4 * dpr, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    if (withText) {
+      var last = toScreen(points[points.length - 1]);
+      ctx.font = (13 * dpr) + "px -apple-system, system-ui, sans-serif";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(withText, last[0] + 8 * dpr, last[1] - 6 * dpr);
+    }
+  }
+
+  function drawMarks() {
+    if (current < 0) return;
+    (marks[current] || []).forEach(function (m) { drawPolyline(m.points, m.text); });
+    if (pending.length) drawPolyline(pending, "");
+  }
+
+  // ------------------------------------------------------------ measuring
+  function setMode(next) {
+    pending = [];
+    mode = mode === next ? MODE_NONE : next;
+    el("distance").setAttribute("aria-pressed", String(mode === MODE_DISTANCE));
+    el("angle").setAttribute("aria-pressed", String(mode === MODE_ANGLE));
+    updateStatus(mode === MODE_NONE ? "" : "tap points");
+    requestDraw();
+  }
+
+  function cancelMeasurement() {
+    pending = [];
+    mode = MODE_NONE;
+    el("distance").setAttribute("aria-pressed", "false");
+    el("angle").setAttribute("aria-pressed", "false");
+  }
+
+  function clearMeasurements() {
+    if (current >= 0) marks[current] = [];
+    pending = [];
+    requestDraw();
+    updateStatus();
+  }
+
+  function addPoint(x, y) {
+    var f = film();
+    if (!f || mode === MODE_NONE) return;
+    pending.push([x, y]);
+    var needed = mode === MODE_DISTANCE ? 2 : 3;
+    if (pending.length < needed) {
+      updateStatus(pending.length + "/" + needed + " points");
+      requestDraw();
+      return;
+    }
+    var points = pending.slice();
+    pending = [];
+    var calibrated = f.spacingIsValid;
+    var spacing = calibrated ? f.spacingMm : [1.0, 1.0];
+    var text = mode === MODE_DISTANCE
+      ? XV.formatDistance(points[0], points[1], spacing, calibrated)
+      : XV.formatAngle(points[0], points[1], points[2], spacing);
+    marks[current].push({ points: points, text: text });
+    updateStatus(text);
+    requestDraw();
+  }
+
+  function updateStatus(message) {
+    var f = film();
+    if (!f) { statusBox.textContent = ""; return; }
+    var lo = levels[current][0], hi = levels[current][1];
+    var base = f.label + " — W " + Math.round(hi - lo) + " / L " + Math.round((lo + hi) / 2);
+    base += "  " + f.cols + "×" + f.rows;
+    if (!f.spacingIsValid) base += " — uncalibrated (px)";
+    statusBox.textContent = (base + "   " + (message || "")).trim();
+  }
+
+  // ------------------------------------------------------- touch / pointer
+  var pointers = new Map();
+  var gesture = null;
+
+  function localPoint(ev) {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var r = canvas.getBoundingClientRect();
+    return { x: (ev.clientX - r.left) * dpr, y: (ev.clientY - r.top) * dpr };
+  }
+
+  function imagePoint(p) {
+    return [(p.x - xform.tx) / xform.scale, (p.y - xform.ty) / xform.scale];
+  }
+
+  canvas.addEventListener("pointerdown", function (ev) {
+    if (!film()) return;
+    // Capture keeps a finger that slides off the canvas still driving the pan; if the
+    // browser refuses it the gesture must still work, so a failure here is not fatal.
+    try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* no capture, still tracked below */ }
+    var p = localPoint(ev);
+    pointers.set(ev.pointerId, { start: p, last: p, moved: 0, time: Date.now() });
+    gesture = pointers.size >= 2 ? pinchState() : null;
+  });
+
+  function pinchState() {
+    var pts = Array.from(pointers.values());
+    var a = pts[0].last, b = pts[1].last;
+    return {
+      dist: Math.hypot(b.x - a.x, b.y - a.y) || 1,
+      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      scale: xform.scale, tx: xform.tx, ty: xform.ty,
+    };
+  }
+
+  canvas.addEventListener("pointermove", function (ev) {
+    var rec = pointers.get(ev.pointerId);
+    if (!rec || !film()) return;
+    var p = localPoint(ev);
+    rec.moved += Math.hypot(p.x - rec.last.x, p.y - rec.last.y);
+    var prev = rec.last;
+    rec.last = p;
+
+    if (pointers.size === 1) {
+      xform.tx += p.x - prev.x;
+      xform.ty += p.y - prev.y;
+      requestDraw();
+      return;
+    }
+    if (pointers.size >= 2) {
+      if (!gesture) { gesture = pinchState(); return; }
+      var pts = Array.from(pointers.values());
+      var a = pts[0].last, b = pts[1].last;
+      var dist = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      var mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      var factor = dist / gesture.dist;
+      var scale = Math.min(Math.max(gesture.scale * factor, 0.02), 40);
+      // Keep the point under the pinch centre fixed while the two fingers also pan it.
+      xform.scale = scale;
+      xform.tx = mid.x - (gesture.mid.x - gesture.tx) * (scale / gesture.scale);
+      xform.ty = mid.y - (gesture.mid.y - gesture.ty) * (scale / gesture.scale);
+      requestDraw();
+    }
+  });
+
+  function endPointer(ev) {
+    var rec = pointers.get(ev.pointerId);
+    pointers.delete(ev.pointerId);
+    if (pointers.size < 2) gesture = null;
+    if (!rec || !film()) return;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var tapped = rec.moved < TAP_SLOP_PX * dpr && Date.now() - rec.time < TAP_MAX_MS;
+    if (tapped && mode !== MODE_NONE) {
+      var ip = imagePoint(rec.last);
+      var f = film();
+      if (ip[0] >= 0 && ip[1] >= 0 && ip[0] <= f.cols && ip[1] <= f.rows) addPoint(ip[0], ip[1]);
+    }
+  }
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
+
+  canvas.addEventListener("wheel", function (ev) {
+    if (!film()) return;
+    ev.preventDefault();
+    var p = localPoint(ev);
+    var factor = Math.exp(-ev.deltaY * 0.0015);
+    var scale = Math.min(Math.max(xform.scale * factor, 0.02), 40);
+    xform.tx = p.x - (p.x - xform.tx) * (scale / xform.scale);
+    xform.ty = p.y - (p.y - xform.ty) * (scale / xform.scale);
+    xform.scale = scale;
+    requestDraw();
+  }, { passive: false });
+
+  // -------------------------------------------------------------- controls
+  el("open").onclick = function () { el("file").click(); };
+  el("file").onchange = function (ev) {
+    var chosen = ev.target.files;
+    if (!chosen || !chosen.length) return;
+    requestPersistence();
+    showError("");
+    statusBox.textContent = "Reading " + chosen.length + " file(s)…";
+    storeFiles(chosen).catch(function (e) { showError("Could not save to this device: " + e.message); });
+    ingest(chosen).catch(function (e) { showError(String(e && e.message || e)); });
+    ev.target.value = "";
+  };
+  el("clear").onclick = function () {
+    films = []; levels = []; marks = []; current = -1;
+    cancelMeasurement();
+    renderViews();
+    emptyBox.classList.remove("hide");
+    showError("");
+    statusBox.textContent = "";
+    clearStore();
+    draw();
+  };
+  el("brightness").oninput = onWindowSlider;
+  el("contrast").oninput = onWindowSlider;
+  el("invert").onclick = function () {
+    invertOn = !invertOn;
+    el("invert").setAttribute("aria-pressed", String(invertOn));
+    el("strength").disabled = !invertOn;
+    if (invertOn) {
+      invertStrength = INVERT_STRENGTH_DEFAULT;
+      el("strength").value = String(INVERT_STRENGTH_DEFAULT);
+      el("strengthValue").textContent = INVERT_STRENGTH_DEFAULT + "%";
+    }
+    greyDirty = true;
+    requestDraw();
+  };
+  el("strength").oninput = function () {
+    invertStrength = Number(el("strength").value);
+    el("strengthValue").textContent = invertStrength + "%";
+    greyDirty = true;
+    requestDraw();
+  };
+  el("distance").onclick = function () { setMode(MODE_DISTANCE); };
+  el("angle").onclick = function () { setMode(MODE_ANGLE); };
+  el("clearMeasure").onclick = clearMeasurements;
+  el("resetWindow").onclick = resetWindow;
+  el("fit").onclick = fitToStage;
+
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", function () { setTimeout(resize, 200); });
+
+  // ------------------------------------------------------------ start-up
+  resize();
+  loadStoredFiles().then(function (stored) {
+    if (!stored || !stored.length) return;
+    statusBox.textContent = "Reopening " + stored.length + " saved file(s)…";
+    return ingest(stored);
+  }).catch(function (e) {
+    showError("Saved files could not be reopened: " + String(e && e.message || e));
+  });
+})();
+</script>
