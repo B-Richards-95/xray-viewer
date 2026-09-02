@@ -38,12 +38,27 @@
     background: var(--panel-2); color: var(--ink); font: inherit; cursor: pointer;
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   }
+  select {
+    min-height: var(--tap); padding: 0 10px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel-2); color: var(--ink); font: inherit;
+  }
   button:active { background: #262d36; }
   button[aria-pressed="true"] { background: var(--accent); color: #14181d; border-color: var(--accent); font-weight: 600; }
   button:disabled { opacity: .4; }
 
   #views { display: flex; gap: 6px; overflow-x: auto; padding: 6px 12px; border-bottom: 1px solid var(--line); }
   #views button { white-space: nowrap; }
+
+  #tabs { display: flex; gap: 6px; margin-left: auto; }
+  #panels { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  .panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #reliefStage { position: relative; flex: 1 1 auto; min-height: 0; background: #000; overflow: hidden; }
+  #reliefCanvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
+  #reliefMessage {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 24px; color: var(--ink-dim); font-size: 14px; pointer-events: none;
+  }
+  #reliefNote { flex: 1 1 100%; color: var(--ink-dim); font-size: 12px; }
 
   #stage { position: relative; flex: 1 1 auto; min-height: 0; background: #000; overflow: hidden; }
   #canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
@@ -74,10 +89,16 @@
   <button id="open">Open files</button>
   <button id="clear">Clear</button>
   <input id="file" type="file" multiple accept=".dcm,.dicom,.ima,application/dicom" hidden>
+  <div id="tabs">
+    <button id="tab2d" aria-pressed="true">2D</button>
+    <button id="tabRelief" aria-pressed="false">Relief</button>
+  </div>
 </header>
 
 <div id="views"></div>
 
+<div id="panels">
+<div class="panel" id="panel2d">
 <div id="stage">
   <canvas id="canvas"></canvas>
   <div id="empty">
@@ -103,6 +124,31 @@
     <button id="fit">Fit</button>
   </div>
   <div id="status"></div>
+</div>
+</div>
+
+<div class="panel hide" id="panelRelief">
+  <div id="reliefStage">
+    <canvas id="reliefCanvas"></canvas>
+    <div id="reliefMessage">Open an X-ray, then tap Build.</div>
+  </div>
+  <div id="controls">
+    <div class="group">
+      <button id="reliefBuild">Build</button>
+      <button id="reliefHome">Home</button>
+      <button id="reliefInvert" aria-pressed="false">Invert</button>
+    </div>
+    <div class="group">
+      <span style="color:var(--ink-dim);font-size:13px">Detail</span>
+      <select id="reliefResolution"></select>
+      <span style="color:var(--ink-dim);font-size:13px">Smooth</span>
+      <select id="reliefSmooth"></select>
+      <span style="color:var(--ink-dim);font-size:13px">Strength</span>
+      <select id="reliefInvertStrength"></select>
+    </div>
+    <div id="reliefNote"></div>
+  </div>
+</div>
 </div>
 
 <script src="viewer-core.js"></script>
@@ -233,6 +279,7 @@
       b.setAttribute("aria-pressed", String(i === current));
     });
     updateStatus();
+    if (window.XVApp && window.XVApp.onFilmChange) window.XVApp.onFilmChange();
   }
 
   function film() { return films[current]; }
@@ -576,8 +623,33 @@
   el("resetWindow").onclick = resetWindow;
   el("fit").onclick = fitToStage;
 
-  window.addEventListener("resize", resize);
-  window.addEventListener("orientationchange", function () { setTimeout(resize, 200); });
+  // ------------------------------------------------------------- tabs
+  // The relief tab lives in a module script (it needs a dynamic import for three.js);
+  // it registers itself on window.ReliefTab, so everything here stays optional.
+  var activeTab = "2d";
+
+  function showTab(name) {
+    activeTab = name;
+    el("panel2d").classList.toggle("hide", name !== "2d");
+    el("panelRelief").classList.toggle("hide", name !== "relief");
+    el("tab2d").setAttribute("aria-pressed", String(name === "2d"));
+    el("tabRelief").setAttribute("aria-pressed", String(name === "relief"));
+    if (name === "2d") { resize(); requestDraw(); }
+    else if (window.ReliefTab) window.ReliefTab.activate();
+  }
+  el("tab2d").onclick = function () { showTab("2d"); };
+  el("tabRelief").onclick = function () { showTab("relief"); };
+
+  // The bridge the relief module reads: current film, and a nudge when the selection changes.
+  window.XVApp = {
+    film: function () { return current >= 0 ? films[current] : null; },
+    onFilmChange: null,
+  };
+
+  window.addEventListener("resize", function () { resize(); if (window.ReliefTab) window.ReliefTab.resize(); });
+  window.addEventListener("orientationchange", function () {
+    setTimeout(function () { resize(); if (window.ReliefTab) window.ReliefTab.resize(); }, 200);
+  });
 
   // ------------------------------------------------------------ start-up
   resize();
@@ -589,4 +661,304 @@
     showError("Saved files could not be reopened: " + String(e && e.message || e));
   });
 })();
+</script>
+
+<script type="module">
+/* Relief tab — reduced port of src/xray_viewer/view3d_relief.py.
+ *
+ * Pipeline, identical to the desktop at detail=0 / rounding=0 (where its unsharp_mask and
+ * round_height are both the identity):
+ *     crop_to_content -> downsample -> normalize(window_range) -> clip_percentiles -> gaussian_blur
+ *
+ * ponytail: no dome field, no canal rounding, no unsharp detail, no auto presets, and the
+ * texture is the plain normalised image rather than desktop's filled_texture. Upgrade path is
+ * porting dome_field / closing_lift / filled_texture out of view3d_relief.py in that order.
+ *
+ * ponytail: three.js 0.170.0 ships no UMD build on cdnjs (only three.module.min.js), so this is
+ * an ES module with a dynamic import rather than a plain <script> tag, and OrbitControls is not
+ * on cdnjs for this version either — the ~70-line touch orbit below stands in for it. Upgrade
+ * path: a build step, or a version of three whose examples/jsm is mirrored.
+ */
+const THREE_URL = "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.170.0/three.module.min.js";
+
+const XV = globalThis.XV;
+const el = (id) => document.getElementById(id);
+const canvas = el("reliefCanvas");
+const message = el("reliefMessage");
+
+let THREE = null;
+let renderer = null, scene = null, camera = null, mesh = null;
+let target = [0, 0, 0], radius = 1, elevation = XV.HOME_ELEVATION_DEG, azimuth = XV.HOME_AZIMUTH_DEG;
+let builtFor = null;          // the film a mesh was last built from
+let invertOn = false;
+let needsRender = false;
+
+el("reliefNote").textContent = XV.RELIEF_NOTE;
+XV.RESOLUTIONS.forEach((r) => el("reliefResolution").add(new Option(r + "²", String(r))));
+XV.SMOOTH_PRESETS.forEach(([name, sigma]) => el("reliefSmooth").add(new Option(name, String(sigma))));
+el("reliefSmooth").value = String(XV.SMOOTH_DEFAULT);
+XV.INVERT_PRESETS.forEach(([name, pct]) => el("reliefInvertStrength").add(new Option(name, String(pct))));
+el("reliefInvertStrength").value = String(XV.INVERT_DEFAULT);
+
+function setMessage(text) {
+  message.textContent = text || "";
+  message.style.display = text ? "flex" : "none";
+}
+
+// ------------------------------------------------------------------ geometry
+
+/** The desktop's height field and its grey texture, for one film at one preset. */
+function reliefFields(film, resolution, sigma) {
+  const full = { data: Float32Array.from(film.pixels), rows: film.rows, cols: film.cols };
+  const small = XV.downsample(XV.cropToContent(full), resolution);
+  const detail = XV.normalize(small, film.windowRange);
+  const height = XV.gaussianBlur(XV.clipPercentiles(detail), sigma);
+  return { detail, height };
+}
+
+function buildTexture(detail, strength) {
+  const lut = XV.invertLut(strength);
+  const { rows, cols, data } = detail;
+  const rgba = new Uint8Array(rows * cols * 4);
+  for (let r = 0; r < rows; r++) {
+    // Row 0 of a DataTexture is v=0, which is the bottom of the plane, so the image is
+    // written bottom row first to keep the texture the right way up on the mesh.
+    const src = (rows - 1 - r) * cols;
+    const dst = r * cols * 4;
+    for (let c = 0; c < cols; c++) {
+      const v = data[src + c];
+      const g = lut[Math.max(0, Math.min(255, Math.round(v * 255)))];
+      rgba[dst + c * 4] = g;
+      rgba[dst + c * 4 + 1] = g;
+      rgba[dst + c * 4 + 2] = g;
+      rgba[dst + c * 4 + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(rgba, cols, rows, THREE.RGBAFormat);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function buildMesh(height, texture) {
+  const { rows, cols, data } = height;
+  // One unit per source pixel, exactly as the desktop's StructuredGrid; PlaneGeometry's
+  // vertices run left-to-right from the top row, which is this array's own row order.
+  const geometry = new THREE.PlaneGeometry(cols - 1, rows - 1, cols - 1, rows - 1);
+  const position = geometry.attributes.position;
+  for (let i = 0; i < data.length; i++) position.setZ(i, data[i] * XV.RELIEF_HEIGHT);
+  position.needsUpdate = true;
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  const material = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.78, metalness: 0.0 });
+  return new THREE.Mesh(geometry, material);
+}
+
+// -------------------------------------------------------------------- camera
+
+function applyCamera() {
+  const p = XV.orbitPoint(target, radius, elevation, azimuth);
+  camera.position.set(p[0], p[1], p[2]);
+  camera.up.set(0, 0, 1);
+  camera.lookAt(target[0], target[1], target[2]);
+  needsRender = true;
+}
+
+function goHome() {
+  if (!mesh) return;
+  const box = mesh.geometry.boundingBox;
+  target = [(box.min.x + box.max.x) / 2, (box.min.y + box.max.y) / 2, (box.min.z + box.max.z) / 2];
+  elevation = XV.HOME_ELEVATION_DEG;
+  azimuth = XV.HOME_AZIMUTH_DEG;
+
+  // The desktop points the camera with HOME_DISTANCE_FACTOR, then calls reset_camera(), which
+  // keeps that direction but pulls back until the whole mesh fits, and only then zooms in by
+  // HOME_ZOOM. The fit is what actually sets the distance, so it is reproduced here rather
+  // than using the factor as a distance on its own.
+  const span = Math.max(box.max.x - box.min.x, box.max.y - box.min.y) * XV.HOME_DISTANCE_FACTOR;
+  const sphere = 0.5 * Math.hypot(box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z);
+  const vFov = (camera.fov * Math.PI) / 180;
+  const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
+  const fit = sphere / Math.sin(Math.min(vFov, hFov) / 2);
+  radius = Math.max(fit, span * 0.001);
+
+  camera.near = Math.max(radius / 1000, 0.01);
+  camera.far = radius * 20;
+  camera.zoom = XV.HOME_ZOOM;
+  camera.updateProjectionMatrix();
+  applyCamera();
+}
+
+/* Minimal touch orbit: one finger rotates, two fingers pinch to dolly and drag to pan.
+ * Stands in for OrbitControls, which cdnjs does not carry for three 0.170.0. */
+const pointers = new Map();
+let pinchDist = 0;
+
+function pointerList() { return Array.from(pointers.values()); }
+
+canvas.addEventListener("pointerdown", (ev) => {
+  try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* capture is optional */ }
+  pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  if (pointers.size === 2) {
+    const [a, b] = pointerList();
+    pinchDist = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  }
+});
+
+canvas.addEventListener("pointermove", (ev) => {
+  const rec = pointers.get(ev.pointerId);
+  if (!rec || !mesh) return;
+  const dx = ev.clientX - rec.x;
+  const dy = ev.clientY - rec.y;
+  rec.x = ev.clientX;
+  rec.y = ev.clientY;
+
+  if (pointers.size === 1) {
+    azimuth -= dx * 0.4;
+    elevation = Math.max(-89, Math.min(89, elevation + dy * 0.4));
+    applyCamera();
+    return;
+  }
+  if (pointers.size >= 2) {
+    const [a, b] = pointerList();
+    const dist = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    radius = Math.max(1e-3, radius * (pinchDist / dist));
+    pinchDist = dist;
+    // Two-finger drag slides the focus point across the screen plane.
+    const right = new THREE.Vector3();
+    const up = new THREE.Vector3();
+    camera.matrixWorld.extractBasis(right, up, new THREE.Vector3());
+    const k = (radius * 0.002) / camera.zoom;
+    target = [
+      target[0] - (right.x * dx + up.x * -dy) * k,
+      target[1] - (right.y * dx + up.y * -dy) * k,
+      target[2] - (right.z * dx + up.z * -dy) * k,
+    ];
+    applyCamera();
+  }
+});
+
+function endPointer(ev) {
+  pointers.delete(ev.pointerId);
+  if (pointers.size < 2) pinchDist = 0;
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("wheel", (ev) => {
+  if (!mesh) return;
+  ev.preventDefault();
+  radius = Math.max(1e-3, radius * Math.exp(ev.deltaY * 0.0015));
+  applyCamera();
+}, { passive: false });
+
+// ------------------------------------------------------------------ renderer
+
+async function ensureThree() {
+  if (THREE) return true;
+  try {
+    THREE = await import(THREE_URL);
+  } catch (e) {
+    setMessage("The 3D library could not be loaded. Connect to the internet once so it can be cached for offline use.");
+    return false;
+  }
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+  camera = new THREE.PerspectiveCamera(30, 1, 0.1, 1000);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const key = new THREE.DirectionalLight(0xffffff, 2.1);
+  key.position.set(-0.6, -0.7, 1.0);
+  scene.add(key);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.5);
+  fill.position.set(0.8, 0.4, 0.6);
+  scene.add(fill);
+  resize();
+  (function loop() {
+    requestAnimationFrame(loop);
+    if (needsRender && renderer && scene && camera) { needsRender = false; renderer.render(scene, camera); }
+  })();
+  return true;
+}
+
+function resize() {
+  if (!renderer) return;
+  const w = canvas.clientWidth || 1;
+  const h = canvas.clientHeight || 1;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  needsRender = true;
+}
+
+async function build() {
+  const film = window.XVApp && window.XVApp.film();
+  if (!film) { setMessage("Open an X-ray first."); return; }
+  if (!(await ensureThree())) return;
+
+  setMessage("Building relief…");
+  await new Promise((r) => setTimeout(r, 30));   // let the message paint before the blocking work
+  try {
+    const resolution = Number(el("reliefResolution").value);
+    const sigma = Number(el("reliefSmooth").value);
+    const { detail, height } = reliefFields(film, resolution, sigma);
+    const texture = buildTexture(detail, invertOn ? Number(el("reliefInvertStrength").value) / 100 : 0);
+    if (mesh) {
+      scene.remove(mesh);
+      mesh.geometry.dispose();
+      if (mesh.material.map) mesh.material.map.dispose();
+      mesh.material.dispose();
+    }
+    mesh = buildMesh(height, texture);
+    scene.add(mesh);
+    builtFor = film;
+    resize();
+    goHome();
+    setMessage("");
+  } catch (e) {
+    setMessage("Relief could not be built: " + (e && e.message ? e.message : String(e)));
+  }
+}
+
+function retexture() {
+  if (!mesh || !builtFor) return;
+  const resolution = Number(el("reliefResolution").value);
+  const sigma = Number(el("reliefSmooth").value);
+  const { detail } = reliefFields(builtFor, resolution, sigma);
+  const next = buildTexture(detail, invertOn ? Number(el("reliefInvertStrength").value) / 100 : 0);
+  if (mesh.material.map) mesh.material.map.dispose();
+  mesh.material.map = next;
+  mesh.material.needsUpdate = true;
+  needsRender = true;
+}
+
+el("reliefBuild").onclick = build;
+el("reliefHome").onclick = goHome;
+el("reliefInvert").onclick = () => {
+  invertOn = !invertOn;
+  el("reliefInvert").setAttribute("aria-pressed", String(invertOn));
+  retexture();
+};
+el("reliefInvertStrength").onchange = retexture;
+el("reliefResolution").onchange = () => { if (builtFor) build(); };
+el("reliefSmooth").onchange = () => { if (builtFor) build(); };
+
+window.XVApp = window.XVApp || {};
+window.XVApp.onFilmChange = function () {
+  // A different film invalidates the mesh; rebuilding is the user's call, it is not cheap.
+  if (builtFor && window.XVApp.film() !== builtFor) setMessage("Different X-ray selected — tap Build.");
+};
+
+window.ReliefTab = {
+  activate: function () {
+    ensureThree().then((ok) => {
+      if (!ok) return;
+      resize();
+      if (!mesh) setMessage(window.XVApp.film() ? "Tap Build to make the relief." : "Open an X-ray first.");
+    });
+  },
+  resize: resize,
+};
 </script>
