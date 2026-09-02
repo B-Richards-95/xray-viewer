@@ -1,4 +1,4 @@
-# Elbow X-ray viewer (iPad)
+# X-ray viewer (iPad)
 
 Offline web viewer for my own elbow radiographs: 2D windowing with tap-to-measure, plus an
 intensity relief. No build step, no framework — `index.html` and `viewer-core.js` are the app.

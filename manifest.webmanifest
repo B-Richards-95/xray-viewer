@@ -1,6 +1,6 @@
 {
-  "name": "Elbow X-ray viewer",
-  "short_name": "Elbow X-ray",
+  "name": "X-ray viewer",
+  "short_name": "X-ray viewer",
   "description": "Offline DICOM viewer for my own elbow radiographs: windowing, measurements and an intensity relief.",
   "start_url": "./",
   "scope": "./",
