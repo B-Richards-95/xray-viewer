@@ -7,6 +7,10 @@ intensity relief. No build step, no framework — `index.html` and `viewer-core.
 desktop app. To see it: `python -m http.server 8765 --directory ipad`, then open
 <http://localhost:8765/> and pick the `.dcm` files.
 
+**The files must be DICOM.** That is the medical image format (`.dcm`) a hospital or imaging
+centre exports; a JPEG, PNG, or PDF of an X-ray will not open. Ask for "DICOM files" or "the
+DICOM disc" if you only have pictures.
+
 **Get the X-rays onto the iPad.** Plug it in and copy the four `.dcm` files across with the
 Apple Devices app, or AirDrop them. They land in Files, which is where the viewer picks them up.
 
