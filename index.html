@@ -1976,6 +1976,19 @@ function tapBuild(ev) {
 }
 el("reliefBuild").addEventListener("pointerup", tapBuild);
 el("reliefBuild").addEventListener("click", tapBuild);
+
+// Tap tracer + fallback (iPad, 2026-09-03): the Build button never heard a touch on Blake's
+// iPad while the emulator built fine. Every touch on the page names its target on the panel,
+// and a tap on the empty relief stage builds too — a target no toolbar overlap can hide.
+document.addEventListener("pointerdown", (ev) => {
+  if (mesh || el("panelRelief") && el("panelRelief").classList.contains("hide")) return;
+  const t = ev.target;
+  const name = t && t.tagName ? t.tagName.toLowerCase() + (t.id ? "#" + t.id : "") : String(t);
+  setMessage("Touch on " + name + " (" + ev.pointerType + ")" + (t === canvas ? " — building…" : " — tap Build, or tap the black area to build."));
+}, true);
+canvas.addEventListener("pointerup", (ev) => {
+  if (!mesh && window.XVApp && window.XVApp.film() && pointers.size <= 1) tapBuild(ev);
+});
 el("reliefHome").onclick = goHome;
 el("reliefInvert").onclick = () => {
   invertOn = !invertOn;
