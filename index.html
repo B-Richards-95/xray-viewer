@@ -280,6 +280,7 @@
   var tool = null;           // null = view mode; otherwise a key of TOOL_BUTTONS
   var pending = [];          // image-px points of the mark being placed
   var hover = null;          // live point under the pen/mouse, for the rubber band
+  var penAnchor = null;      // where a pen stroke touched down, first point of a 2-point drag
   var marks = [];            // per film index: [{id, type, pts, meta}], all in image px
   var undoStack = [], redoStack = [];   // snapshots of marks[current], newest last
   var loupe = null;          // {x, y} in canvas px while a finger drags a handle
@@ -465,6 +466,12 @@
   }
 
   function film() { return films[current]; }
+
+  /** Is an image-px point on the film? */
+  function insideFilm(ip) {
+    var f = film();
+    return !!f && ip[0] >= 0 && ip[1] >= 0 && ip[0] <= f.cols && ip[1] <= f.rows;
+  }
 
   // ------------------------------------------------------------- windowing
   function syncSliders() {
@@ -742,7 +749,7 @@
     if (liveStroke && liveStroke.length > 1) {
       drawMarkupMark(c, { type: tool, pts: liveStroke, meta: inkMeta() }, xf, dpr);
     }
-    if (pending.length) {
+    if (pending.length || penAnchor) {
       var preview = previewMark();
       if (XV.isMarkup(preview)) drawMarkupMark(c, preview, xf, dpr);
       else drawMark(c, preview, xf, dpr, true);
@@ -756,6 +763,7 @@
   /** The mark being placed, with the live point under the pen/mouse on the end of it. */
   function previewMark() {
     var pts = pending.slice();
+    if (!pts.length && penAnchor) pts.push(penAnchor);
     if (hover && pts.length < (XV.POINTS_NEEDED[tool] || 0)) pts.push(hover);
     return { id: "preview", type: tool, pts: pts, meta: XV.isMarkup({ type: tool }) ? inkMeta() : {} };
   }
@@ -873,6 +881,7 @@
     tool = tool === next ? null : next;
     pending = [];
     hover = null;
+    penAnchor = null;
     liveStroke = null;
     hidePopover();
     hideCalibForm();
@@ -887,6 +896,7 @@
     tool = null;
     pending = [];
     hover = null;
+    penAnchor = null;
     liveStroke = null;
     hidePopover();
     hideCalibForm();
@@ -1171,7 +1181,14 @@
       liveStroke = rec.stroke;
     }
     if (!rec.edit && rec.type === "pen" && XV.gestureFor(rec.type, toolMode(), 1, locked) === "place") {
-      hover = imagePoint(p);   // pen: rubber-band from the moment it touches down
+      var downIp = imagePoint(p);
+      hover = downIp;          // pen: rubber-band from the moment it touches down
+      // A 2-point tool started on the film draws its whole mark in one stroke: the rubber
+      // band hangs off the touchdown, which becomes the first point if the pen slides.
+      if (!pending.length && (XV.POINTS_NEEDED[tool] || 0) === 2 && !isFreehand() && insideFilm(downIp)) {
+        rec.anchor = downIp;
+        penAnchor = downIp;
+      }
       requestDraw();
     }
     if (pointers.size >= 2) {
@@ -1282,6 +1299,8 @@
     if (pointers.size < 2) gesture = null;
     loupe = null;
     hover = null;
+    var anchored = penAnchor;
+    penAnchor = null;
     if (!rec || !film()) { liveStroke = null; requestDraw(); return; }
     if (rec.stroke) {
       liveStroke = null;
@@ -1304,9 +1323,12 @@
     var tapped = rec.type === "pen" || (rec.moved < TAP_SLOP_PX * dpr && Date.now() - rec.time < TAP_MAX_MS);
     if (tapped) {
       var ip = imagePoint(rec.last);
-      var f = film();
-      if (ip[0] >= 0 && ip[1] >= 0 && ip[0] <= f.cols && ip[1] <= f.rows) {
-        if (tool === "eraser") eraseAt(ip); else addPoint(ip[0], ip[1]);
+      if (insideFilm(ip)) {
+        // A pen that slid across the film places both ends of a 2-point mark in one stroke.
+        var slid = rec.anchor && anchored && !pending.length && rec.moved >= TAP_SLOP_PX * dpr;
+        if (tool === "eraser") eraseAt(ip);
+        else if (slid) { addPoint(rec.anchor[0], rec.anchor[1]); addPoint(ip[0], ip[1]); }
+        else addPoint(ip[0], ip[1]);
       }
     }
   }
