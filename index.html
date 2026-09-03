@@ -61,7 +61,10 @@
   #panels { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   .panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   #reliefStage, #ctStage { position: relative; flex: 1 1 auto; min-height: 0; background: #000; overflow: hidden; }
-  #reliefCanvas, #ctCanvas, #ctGl { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
+  #reliefCanvas, #ctCanvas, #ctGl, #ctMarks { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
+  /* The marks overlay never takes a touch of its own: the CT tab listens on #ctGl and #ctStage
+     so Niivue's own two-finger gestures still reach it. */
+  #ctMarks { pointer-events: none; z-index: 2; }
   /* The engine canvas hides by going invisible, never by display:none: a WebGL canvas that
      was laid out at zero size when its context was made stays black in iPad Safari. */
   .idle { visibility: hidden; }
@@ -104,6 +107,8 @@
   .group { display: flex; gap: 6px; align-items: center; }
   #status, #ctStatus { flex: 1 1 100%; color: var(--ink-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
   .hide { display: none !important; }
+  /* Buttons the CT tab borrows the tool row without: hidden while the row sits in the CT bar. */
+  #panelCT .only2d { display: none; }
 
   /* One row of tools: never wraps, scrolls sideways when the screen is too narrow. */
   #tools { display: flex; gap: 6px; flex: 1 1 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -228,13 +233,18 @@
     <button id="toolEllipse" aria-pressed="false">Ellipse</button>
     <button id="toolPoint" aria-pressed="false">Point</button>
     <button id="toolText" aria-pressed="false">Text</button>
-    <button id="toolCalibrate" aria-pressed="false">Calibrate</button>
-    <button id="clearCalib" disabled>Clear calibration</button>
-    <button id="markup" aria-pressed="false">Markup</button>
+    <!-- Calibrate and its Clear only mean something on a film: a CT is calibrated by the
+         scanner, so the CT tab hides both, and hides the Markup toggle because the CT tab
+         shows the markup row all the time (a row that appears would change the bar's height,
+         which blanks the WebGL pane in WebKit). -->
+    <button id="toolCalibrate" class="only2d" aria-pressed="false">Calibrate</button>
+    <button id="clearCalib" class="only2d" disabled>Clear calibration</button>
+    <button id="markup" class="only2d" aria-pressed="false">Markup</button>
     <button id="savePng">Save PNG</button>
     <button id="undo" disabled>Undo</button>
     <button id="redo" disabled>Redo</button>
     <button id="undoPoint">Undo point</button>
+    <button id="clearMeasure">Clear marks</button>
   </div>
   <div id="markupTools" class="hide">
     <button id="mkInk" aria-pressed="false">Pen</button>
@@ -247,13 +257,13 @@
     <span id="swatches"></span>
     <span id="widths"></span>
   </div>
-  <div class="group">
+  <!-- Named so the shared tool rows know where to come back to when the 2-D tab takes them. -->
+  <div class="group" id="controls2dGroup">
     <button id="resetWindow">Reset window</button>
     <button id="lock" aria-pressed="false">Lock</button>
     <button id="fit">Fit</button>
     <button id="rotateLeft">Rotate L</button>
     <button id="rotateRight">Rotate R</button>
-    <button id="clearMeasure">Clear marks</button>
   </div>
   <div id="status"></div>
 </div>
@@ -292,6 +302,8 @@
     <canvas id="ctCanvas"></canvas>
     <!-- The CT engine draws here; #ctCanvas above is the one-slice fallback when it cannot. -->
     <canvas id="ctGl" class="idle"></canvas>
+    <!-- 4.1: measurements and markup, in millimetres, drawn over whichever pane owns them. -->
+    <canvas id="ctMarks" class="idle"></canvas>
     <div id="ctMessage">No CT or MR series open yet.</div>
     <div id="ctProbe"></div>
   </div>
@@ -804,8 +816,10 @@
   /* One mark, on whatever context and transform it is asked for (the loupe passes its own,
    * the PNG export passes an identity one at native film resolution). Shapes are built in
    * screen space so rotation and zoom come along for free.
+   * `labelOverride` is what the CT tab passes: its marks are measured in millimetres on their
+   * own plane, which labelOf (a 2-D, pixel-spacing thing) cannot work out.
    */
-  function drawMark(c, mark, xf, dpr, live) {
+  function drawMark(c, mark, xf, dpr, live, labelOverride) {
     var pts = mark.pts || [];
     if (!pts.length) return;
     var colour = mark.meta && mark.meta.reference ? REFERENCE_COLOUR : MARK_COLOUR;
@@ -840,7 +854,7 @@
       c.arc(p[0], p[1], 4 * dpr, 0, Math.PI * 2);
       c.fill();
     });
-    var text = labelOf(mark);
+    var text = labelOverride === undefined ? labelOf(mark) : labelOverride;
     if (text) {
       var last = s[s.length - 1];
       c.font = (13 * dpr) + "px -apple-system, system-ui, sans-serif";
@@ -876,13 +890,15 @@
     c.fill();
   }
 
-  /** A markup stroke: its own colour, its width measured on the film so zoom scales it. */
-  function drawMarkupMark(c, mark, xf, dpr) {
+  /** A markup stroke: its own colour, its width measured on the film so zoom scales it.
+   *  `widthOverride` is the CT tab's: its ink is measured in millimetres, not film pixels. */
+  function drawMarkupMark(c, mark, xf, dpr, widthOverride) {
     var pts = mark.pts || [];
     if (!pts.length) return;
     var meta = mark.meta || {};
     var scale = (xf || xform).scale;
-    var width = Math.max(1, (meta.width || MARKUP_WIDTHS[1]) * scale);
+    var width = Math.max(1, widthOverride === undefined
+      ? (meta.width || MARKUP_WIDTHS[1]) * scale : widthOverride);
     var s = pts.map(function (p) { return toScreen(p, xf); });
     c.save();
     c.strokeStyle = meta.color || MARKUP_COLOURS[0];
@@ -1006,8 +1022,11 @@
   }
 
   function syncUndoButtons() {
-    el("undo").disabled = !undoStack.length;
-    el("redo").disabled = !redoStack.length;
+    // The tool row is one row, borrowed by whichever tab is on screen, so its Undo and Redo
+    // report whichever stack that tab keeps.
+    var on = activeTab === "ct";
+    el("undo").disabled = on ? !ctUndoStack.length : !undoStack.length;
+    el("redo").disabled = on ? !ctRedoStack.length : !redoStack.length;
   }
 
   function afterEdit() {
@@ -1019,6 +1038,7 @@
   }
 
   function undo() {
+    if (activeTab === "ct") { ctUndo(); return; }
     if (current < 0 || !undoStack.length) return;
     redoStack.push(cloneMarks(marks[current]));
     marks[current] = undoStack.pop();
@@ -1027,6 +1047,7 @@
   }
 
   function redo() {
+    if (activeTab === "ct") { ctRedo(); return; }
     if (current < 0 || !redoStack.length) return;
     undoStack.push(cloneMarks(marks[current]));
     marks[current] = redoStack.pop();
@@ -1050,6 +1071,9 @@
     if (!tool) return "";
     if (isFreehand()) return "draw with the pen or one finger";
     if (tool === "eraser") return "tap a markup stroke to erase it";
+    if (activeTab === "ct") {
+      return "tap " + XV.POINTS_NEEDED[tool] + " point(s) on one pane — it stays on that slice";
+    }
     if (tool === "calibrate") return "draw a line across something you know the size of";
     return "tap " + XV.POINTS_NEEDED[tool] + " point(s)";
   }
@@ -1065,6 +1089,12 @@
     allToolNames().forEach(function (name) {
       el(toolButtonId(name)).setAttribute("aria-pressed", String(tool === name));
     });
+    if (activeTab === "ct") {
+      ctCancelPlacement();
+      updateCtStatus(toolHint());
+      ctRequestMarksDraw();
+      return;
+    }
     updateStatus(toolHint());
     requestDraw();
   }
@@ -1077,12 +1107,14 @@
     liveStroke = null;
     hidePopover();
     hideCalibForm();
+    ctCancelPlacement();
     allToolNames().forEach(function (name) {
       el(toolButtonId(name)).setAttribute("aria-pressed", "false");
     });
   }
 
   function clearMeasurements() {
+    if (activeTab === "ct") { ctClearMarks(); return; }
     if (current >= 0 && (marks[current] || []).length) pushUndo();
     if (current >= 0) marks[current] = [];
     pending = [];
@@ -1091,6 +1123,7 @@
 
   /** Drop the point placed last; with nothing pending, drop the last whole mark. */
   function undoLastPoint() {
+    if (activeTab === "ct") { ctUndoLastPoint(); return; }
     if (pending.length) { pending.pop(); requestDraw(); updateStatus(); return; }
     if (current < 0 || !(marks[current] || []).length) return;
     pushUndo();
@@ -1224,6 +1257,7 @@
   // -------------------------------------------------------------- popover
   function hidePopover() {
     popMark = -1;
+    ctPopMark = null;
     el("markPop").classList.remove("show");
   }
 
@@ -1531,6 +1565,7 @@
    * same drawing code as the screen — an identity transform is all that changes.
    */
   function exportPng() {
+    if (activeTab === "ct") { ctExportPng(); return; }
     var f = film();
     if (!f) return;
     if (greyDirty) rebuildGrey();
@@ -1952,6 +1987,7 @@
 
   function ctShowEngine(on) {
     ctGl.classList.toggle("idle", !on);
+    ctMarksCanvas.classList.toggle("idle", !on);
     ctCanvas.classList.toggle("idle", !!on);
   }
 
@@ -1982,7 +2018,10 @@
       instance.onLocationChange = function (data) {
         ctWhere = data;
         updateCtStatus();
+        // The crosshair moved, so the panes moved: the marks overlay has to follow them.
+        ctRequestMarksDraw();
       };
+      instance.onImageLoaded = function () { ctResizeMarks(); };
       return instance.attachToCanvas(ctGl).then(function () {
         nv = instance;
         // Home has to put the camera back where the engine chose to start it, and the engine's
@@ -2041,6 +2080,7 @@
       nv.volumes.slice().forEach(function (old) { nv.removeVolume(old); });
       nv.addVolume(image);
       nv.setRadiologicalConvention(ctRadiological);
+      ctSnapCrosshair();
       ctBuiltFor = index;
       ctPristine = null;
       ctSlabNote = "";
@@ -2169,11 +2209,10 @@
   function ctRememberWindow() {
     var series = seriesList[ctIndex];
     if (!series || !series.uid) return;
-    var record = { uid: series.uid, preset: ctPresetKey, width: ctWidth, level: ctLevel };
     clearTimeout(ctWindowSaveTimer);
-    ctWindowSaveTimer = setTimeout(function () {
-      saveCtMeta(record).catch(function () { /* full or private: it just will not come back */ });
-    }, SAVE_DEBOUNCE_MS);
+    // The window and the marks share one record per series, so both are written together —
+    // saving one alone would drop the other.
+    ctWindowSaveTimer = setTimeout(ctSaveMeta, SAVE_DEBOUNCE_MS);
   }
 
   function ctRestoreWindow(series, stale) {
@@ -2181,6 +2220,7 @@
     loadCtMeta(series.uid).then(function (rec) {
       if (!rec || stale() || !ctVolume()) return;
       ctSetWindow(rec.width, rec.level, rec.preset, false);
+      ctApplyStoredMarks(rec);
     });
   }
 
@@ -2207,6 +2247,7 @@
     ctApplyBone();
     ctApplySlab();
     updateCtStatus();
+    ctRequestMarksDraw();
   }
 
   function ctSyncModeControls() {
@@ -2303,6 +2344,7 @@
       nv.updateGLVolume();
       ctSlabNote = label;
       updateCtStatus();
+      ctRequestMarksDraw();
     };
     var worker = ctEnsureSlabWorker();
     if (!worker) {
@@ -2323,6 +2365,20 @@
 
   // --------------------------------------------------------- slices and cine
 
+  /* The crosshair starts in the middle of the volume, which on an even number of slices is
+   * halfway between two of them — and a slice plane halfway between two voxels is one a Slice +
+   * then Slice - can never come back to (both steps round to a voxel centre first). A mark
+   * placed on such a plane would vanish on the first slice step and never return, so the
+   * crosshair is put on a voxel centre the moment there is a volume to put it on. */
+  function ctSnapCrosshair() {
+    if (!nv || !nv.volumes.length) return;
+    try {
+      var vox = nv.frac2vox(nv.scene.crosshairPos);
+      nv.scene.crosshairPos = nv.vox2frac(
+        [Math.round(vox[0]), Math.round(vox[1]), Math.round(vox[2])]);
+    } catch (e) { /* no geometry yet: the next build will snap it */ }
+  }
+
   /** One slice along whichever axis the pane on screen scrolls, wrapping at both ends. */
   function ctStepSlice(by) {
     var volume = ctVolume();
@@ -2337,6 +2393,7 @@
     nv.scene.crosshairPos = nv.vox2frac(target);
     nv.drawScene();
     updateCtStatus();
+    ctRequestMarksDraw();
   }
 
   function ctStopCine() {
@@ -2406,10 +2463,11 @@
     box.style.top = Math.round(y) + "px";
   }
 
-  function updateCtStatus() {
+  function updateCtStatus(message) {
     var series = seriesList[ctIndex];
-    if (!series) { el("ctStatus").textContent = ""; return; }
+    if (!series) { el("ctStatus").textContent = message || ""; return; }
     var parts = [series.label];
+    if (message) parts.push(message);
     if (ctBuiltFor === ctIndex && nv && nv.volumes.length) {
       // Read the crosshair off the scene rather than waiting for onLocationChange, so the
       // line is complete the moment the volume lands, not only after the first touch.
@@ -2487,6 +2545,12 @@
     ctBone = false;
     ctSlabMm = 0;
     el("ctSlab").value = "0";
+    // Marks belong to a series, so the stacks that undo them do too.
+    ctUndoStack = [];
+    ctRedoStack = [];
+    ctCancelPlacement();
+    hidePopover();
+    syncUndoButtons();
     ctSyncModeControls();
     if (index >= 0) el("ctSeries").value = String(index);
     renderCtSlice();
@@ -2555,6 +2619,7 @@
       nv.resizeListener();
       nv.drawScene();
     }
+    ctResizeMarks();
   }
 
   /** First arrival on the CT tab with a series chosen is what starts the engine. */
@@ -2573,6 +2638,7 @@
     el("ctRadiological").textContent = ctRadiological ? "Radiological" : "Neurological";
     if (nv) nv.setRadiologicalConvention(ctRadiological);
     updateCtStatus();
+    ctRequestMarksDraw();
   }
   el("ctRadiological").onclick = function () { ctSetRadiological(!ctRadiological); };
 
@@ -2652,8 +2718,10 @@
       nv.scene.pan2Dxyzmm = ctHomeView.pan.slice();
     }
     nv.scene.crosshairPos = [0.5, 0.5, 0.5];
+    ctSnapCrosshair();
     nv.drawScene();
     updateCtStatus();
+    ctRequestMarksDraw();
   };
 
   (function buildCtSlab() {
@@ -2704,13 +2772,758 @@
   ctSyncWindowControls();
   ctSyncModeControls();
 
+  // --------------------------------------------- 4.1/4.2 marks and markup on CT
+  /* A CT mark's points are millimetres of the volume's own RAS space, not pixels of a pane:
+   * zoom, pan, radiological flip and a change of layout all move the panes, and only a point
+   * fixed to the anatomy stays on the anatomy through that. Each mark also records the plane it
+   * was drawn on and that plane's coordinate at the time (meta.plane, meta.sliceMm), which is
+   * what makes it appear on its own slice and nowhere else — and a dot in the other two planes
+   * when their slice passes through it.
+   *
+   * The maths is XV.ctPaneProject / ctPaneUnproject over nv.screenSlices (index.d.ts:2592);
+   * the drawing, hit-testing, popover and undo are the 2-D tab's, reused.
+   */
+  var CT_PROJECT_MM = 1;          // how near a pane's slice a point must pass to show as a dot
+  var CT_DOT_RADIUS = 3;          // css px of the hollow projected dot
+  var CT_IDENTITY = { scale: 1, tx: 0, ty: 0, rot: 0 };
+  var CT_INK_MM = { 3: 0.5, 8: 1.5, 20: 4 };   // the palette's three widths, in millimetres
+
+  var ctMarksCanvas = el("ctMarks");
+  var ctMarksCtx = ctMarksCanvas.getContext("2d");
+  var ctMarkStore = {};       // XV.ctMarkKey(uid, plane) -> [{id, type, pts (mm), meta}]
+  var ctUndoStack = [], ctRedoStack = [];
+  var ctPending = [];         // mm points of the mark being placed
+  var ctPendingPlane = "";
+  var ctPendingSliceMm = 0;
+  var ctHover = null;         // the live mm point under the pen, for the rubber band
+  var ctAnchor = null;        // where a pen stroke touched down
+  var ctLiveStroke = null;
+  var ctPopMark = null;       // {plane, index} of the mark whose popover is open
+  var ctMarkPointers = new Map();
+  var ctTouchMulti = false;   // a two-finger gesture is in progress: Niivue owns it
+  var ctMarksFrame = false;
+  var ctMarkSaveTimer = null;
+
+  function ctIsCt() { return activeTab === "ct"; }
+
+  function ctSeriesUid() {
+    var s = seriesList[ctIndex];
+    return s && s.uid ? s.uid : "";
+  }
+
+  function ctMarksFor(plane) {
+    var uid = ctSeriesUid();
+    if (!uid) return [];
+    var key = XV.ctMarkKey(uid, plane);
+    if (!ctMarkStore[key]) ctMarkStore[key] = [];
+    return ctMarkStore[key];
+  }
+
+  function ctPanes() { return nv && nv.screenSlices ? nv.screenSlices : []; }
+
+  function ctMarksDpr() {
+    var r = ctMarksCanvas.getBoundingClientRect();
+    return r.width ? ctMarksCanvas.width / r.width : dprNow();
+  }
+
+  /** Half a voxel along the plane's own axis: how far the slice may move and still show it. */
+  function ctHalfSliceMm(plane) {
+    var volume = ctVolume();
+    if (!volume) return 0.5;
+    return ctPixDimsRAS(volume)[XV.CT_PLANE_AXIS[plane]] / 2;
+  }
+
+  function ctReferenceMark(plane) {
+    var found = ctMarksFor(plane).filter(function (m) { return m.meta && m.meta.reference; });
+    return found.length ? found[0] : null;
+  }
+
+  function ctLabelOf(mark, plane) {
+    return XV.ctDescribeMark(mark, plane, { reference: ctReferenceMark(plane) });
+  }
+
+  function ctInkMeta() {
+    return { color: inkColour, width: CT_INK_MM[inkWidth] || 1.5 };
+  }
+
+  // ------------------------------------------------------------- CT drawing
+
+  function ctRequestMarksDraw() {
+    if (ctMarksFrame) return;
+    ctMarksFrame = true;
+    requestAnimationFrame(function () { ctMarksFrame = false; ctDrawMarks(); });
+  }
+
+  /** Every point of a mark on one pane, or null if any of them cannot be placed on it. */
+  function ctProjectMark(pane, mark) {
+    var out = [];
+    for (var i = 0; i < (mark.pts || []).length; i++) {
+      var q = XV.ctPaneProject(pane, mark.pts[i]);
+      if (!q) return null;
+      out.push(q);
+    }
+    return out.length ? out : null;
+  }
+
+  /** Is this mark on the slice this pane is showing? */
+  function ctMarkOnSlice(pane, mark, proj) {
+    var meta = mark.meta || {};
+    var here = proj[0].sliceMm;
+    var mine = isFinite(meta.sliceMm) ? meta.sliceMm : here;
+    return XV.ctSliceHit(mine - here, ctHalfSliceMm(XV.ctPlaneFromAxCorSag(pane.axCorSag)));
+  }
+
+  function ctDrawOnPane(c, pane, plane, pxPerMm, dpr, mark, owner, live) {
+    var proj = ctProjectMark(pane, mark);
+    if (!proj) return;
+    if (owner === plane) {
+      if (!live && !ctMarkOnSlice(pane, mark, proj)) return;
+      var flat = {
+        id: mark.id, type: mark.type, meta: mark.meta || {},
+        pts: proj.map(function (q) { return [q.x, q.y]; }),
+      };
+      if (XV.isMarkup(mark)) {
+        drawMarkupMark(c, flat, CT_IDENTITY, dpr,
+          Math.max(1, ((mark.meta && mark.meta.width) || 1.5) * pxPerMm));
+      } else {
+        drawMark(c, flat, CT_IDENTITY, dpr, live, live ? "" : ctLabelOf(mark, owner));
+      }
+      return;
+    }
+    // The other two planes: one hollow dot per point, and only while their slice runs through
+    // it — enough to say "the thing you measured on axial is here", never a second drawing.
+    if (live || XV.isMarkup(mark)) return;
+    c.save();
+    c.strokeStyle = mark.meta && mark.meta.reference ? REFERENCE_COLOUR : MARK_COLOUR;
+    c.lineWidth = 1.5 * dpr;
+    proj.forEach(function (q) {
+      if (!XV.ctSliceHit(q.offMm, CT_PROJECT_MM) || !q.inside) return;
+      c.beginPath();
+      c.arc(q.x, q.y, CT_DOT_RADIUS * dpr, 0, Math.PI * 2);
+      c.stroke();
+    });
+    c.restore();
+  }
+
+  /** The mark being placed right now, in millimetres, or null. */
+  function ctPreviewMark() {
+    if (!tool || (!ctPending.length && !ctAnchor && !ctLiveStroke)) return null;
+    if (ctLiveStroke && ctLiveStroke.length > 1) {
+      return { id: "preview", type: tool, pts: ctLiveStroke, meta: ctInkMeta() };
+    }
+    var pts = ctPending.slice();
+    if (!pts.length && ctAnchor) pts.push(ctAnchor);
+    if (ctHover && pts.length < (XV.POINTS_NEEDED[tool] || 0)) pts.push(ctHover);
+    if (!pts.length) return null;
+    return {
+      id: "preview", type: tool, pts: pts,
+      meta: XV.isMarkup({ type: tool }) ? ctInkMeta() : {},
+    };
+  }
+
+  function ctDrawMarks() {
+    var c = ctMarksCtx;
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.clearRect(0, 0, ctMarksCanvas.width, ctMarksCanvas.height);
+    if (!nv || ctGl.classList.contains("idle") || !ctVolume()) return;
+    var dpr = ctMarksDpr();
+    var preview = ctPreviewMark();
+    ctPanes().forEach(function (pane) {
+      if (pane.axCorSag > 2) return;
+      var plane = XV.ctPlaneFromAxCorSag(pane.axCorSag);
+      var pxPerMm = XV.ctPanePxPerMm(pane);
+      var ltwh = pane.leftTopWidthHeight;
+      var left = ltwh[2] < 0 ? ltwh[0] + ltwh[2] : ltwh[0];
+      c.save();
+      c.beginPath();
+      c.rect(left, ltwh[1], Math.abs(ltwh[2]), ltwh[3]);
+      c.clip();
+      XV.CT_PANE_PLANES.forEach(function (owner) {
+        var list = ctMarksFor(owner);
+        list.forEach(function (m) {
+          if (XV.isMarkup(m)) ctDrawOnPane(c, pane, plane, pxPerMm, dpr, m, owner, false);
+        });
+        list.forEach(function (m) {
+          if (!XV.isMarkup(m)) ctDrawOnPane(c, pane, plane, pxPerMm, dpr, m, owner, false);
+        });
+      });
+      if (preview && ctPendingPlane === plane) {
+        ctDrawOnPane(c, pane, plane, pxPerMm, dpr, preview, plane, true);
+      }
+      c.restore();
+    });
+  }
+
+  function ctResizeMarks() {
+    if (ctMarksCanvas.width !== ctGl.width || ctMarksCanvas.height !== ctGl.height) {
+      ctMarksCanvas.width = ctGl.width || 1;
+      ctMarksCanvas.height = ctGl.height || 1;
+    }
+    ctRequestMarksDraw();
+  }
+
+  // ------------------------------------------------------- CT edits and undo
+
+  function ctSnapshot() {
+    var out = {};
+    XV.CT_PANE_PLANES.forEach(function (p) { out[p] = cloneMarks(ctMarksFor(p)); });
+    return out;
+  }
+
+  function ctPushUndo() {
+    if (!ctSeriesUid()) return;
+    ctUndoStack.push(ctSnapshot());
+    if (ctUndoStack.length > UNDO_CAP) ctUndoStack.shift();
+    ctRedoStack = [];
+    syncUndoButtons();
+  }
+
+  function ctApplySnapshot(snap) {
+    var uid = ctSeriesUid();
+    if (!uid) return;
+    XV.CT_PANE_PLANES.forEach(function (p) {
+      ctMarkStore[XV.ctMarkKey(uid, p)] = cloneMarks(snap[p]);
+    });
+  }
+
+  function ctAfterEdit() {
+    hidePopover();
+    syncUndoButtons();
+    ctScheduleSave();
+    ctRequestMarksDraw();
+    updateCtStatus();
+  }
+
+  function ctUndo() {
+    if (!ctUndoStack.length) return;
+    ctRedoStack.push(ctSnapshot());
+    ctApplySnapshot(ctUndoStack.pop());
+    ctCancelPlacement();
+    ctAfterEdit();
+  }
+
+  function ctRedo() {
+    if (!ctRedoStack.length) return;
+    ctUndoStack.push(ctSnapshot());
+    ctApplySnapshot(ctRedoStack.pop());
+    ctCancelPlacement();
+    ctAfterEdit();
+  }
+
+  function ctCancelPlacement() {
+    ctPending = [];
+    ctPendingPlane = "";
+    ctHover = null;
+    ctAnchor = null;
+    ctLiveStroke = null;
+  }
+
+  function ctClearMarks() {
+    if (!ctSeriesUid()) return;
+    var any = XV.CT_PANE_PLANES.some(function (p) { return ctMarksFor(p).length; });
+    if (any) ctPushUndo();
+    XV.CT_PANE_PLANES.forEach(function (p) { ctMarkStore[XV.ctMarkKey(ctSeriesUid(), p)] = []; });
+    ctCancelPlacement();
+    ctAfterEdit();
+  }
+
+  function ctUndoLastPoint() {
+    if (ctPending.length) { ctPending.pop(); ctRequestMarksDraw(); return; }
+    var plane = ctPendingPlane || ctPlaneOf(ctMode) || "axial";
+    var list = ctMarksFor(plane);
+    if (!list.length) return;
+    ctPushUndo();
+    list.pop();
+    ctAfterEdit();
+  }
+
+  function ctCommitMark(pts, plane, sliceMm) {
+    var meta = { plane: plane, sliceMm: sliceMm };
+    if (tool === "point") {
+      meta.n = ctMarksFor(plane).filter(function (m) { return m.type === "point"; }).length + 1;
+    }
+    if (XV.isMarkup({ type: tool })) {
+      var ink = ctInkMeta();
+      meta.color = ink.color;
+      meta.width = ink.width;
+    }
+    if (tool === "note" || tool === "text") {
+      var typed = window.prompt(tool === "note" ? "Note text" : "Label text", "");
+      if (!typed) { ctRequestMarksDraw(); return; }
+      meta.text = typed;
+    }
+    ctPushUndo();
+    var mark = { id: markId(), type: tool, pts: pts, meta: meta };
+    ctMarksFor(plane).push(mark);
+    ctScheduleSave();
+    ctRequestMarksDraw();
+    updateCtStatus(ctLabelOf(mark, plane));
+  }
+
+  function ctAddPoint(mm, plane, sliceMm) {
+    if (!tool || !plane) return;
+    if (ctPendingPlane && ctPendingPlane !== plane) ctPending = [];
+    ctPendingPlane = plane;
+    ctPendingSliceMm = sliceMm;
+    var needed = XV.POINTS_NEEDED[tool] || 0;
+    ctPending.push(mm);
+    if (ctPending.length < needed) {
+      updateCtStatus(ctPending.length + "/" + needed + " points");
+      ctRequestMarksDraw();
+      return;
+    }
+    var pts = ctPending.slice();
+    ctPending = [];
+    ctCommitMark(pts, plane, sliceMm);
+  }
+
+  function ctCommitStroke(raw, plane, sliceMm) {
+    // The stroke is thinned in the pane's own two millimetre axes, then put back in three.
+    var flat = raw.map(function (p) {
+      var r = XV.ctSwizzleMm(p, plane);
+      return [r[0], r[1]];
+    });
+    var kept = XV.simplifyPolyline(flat, INK_TOLERANCE * 0.2);
+    if (kept.length < 2) return;
+    var pts = kept.map(function (p) { return XV.ctUnswizzleMm([p[0], p[1], sliceMm], plane); });
+    ctPushUndo();
+    var ink = ctInkMeta();
+    ctMarksFor(plane).push({
+      id: markId(), type: tool, pts: pts,
+      meta: { plane: plane, sliceMm: sliceMm, color: ink.color, width: ink.width },
+    });
+    ctAfterEdit();
+  }
+
+  function ctEraseAt(paneIdx, x, y) {
+    var view = ctVisibleOnPane(paneIdx);
+    if (!view) return;
+    var dpr = ctMarksDpr();
+    var reachPx = ERASE_RADIUS * dpr;
+    for (var i = view.flat.length - 1; i >= 0; i--) {
+      var m = view.flat[i];
+      if (!XV.isMarkup(m)) continue;
+      var reach = reachPx + ((m.meta && m.meta.width) || 0) * view.pxPerMm / 2;
+      if (XV.polylineDistance(markPolyline(m), [x, y]) <= reach) {
+        ctPushUndo();
+        ctMarksFor(view.plane).splice(view.map[i], 1);
+        ctAfterEdit();
+        return;
+      }
+    }
+  }
+
+  // ------------------------------------------------------- CT hit-testing
+
+  /** The marks this pane is actually showing, flattened to canvas pixels for hitTest. */
+  function ctVisibleOnPane(paneIdx) {
+    var pane = ctPanes()[paneIdx];
+    if (!pane || pane.axCorSag > 2) return null;
+    var plane = XV.ctPlaneFromAxCorSag(pane.axCorSag);
+    var list = ctMarksFor(plane);
+    var view = { pane: pane, plane: plane, pxPerMm: XV.ctPanePxPerMm(pane), flat: [], map: [] };
+    list.forEach(function (m, i) {
+      var proj = ctProjectMark(pane, m);
+      if (!proj || !ctMarkOnSlice(pane, m, proj)) return;
+      view.flat.push({
+        id: m.id, type: m.type, meta: m.meta || {},
+        pts: proj.map(function (q) { return [q.x, q.y]; }),
+      });
+      view.map.push(i);
+    });
+    return view;
+  }
+
+  /** A canvas pixel as millimetres on a chosen slice of the pane it landed in. */
+  function ctMmAt(pane, x, y, sliceMm) {
+    var mm = XV.ctPaneUnproject(pane, x, y);
+    if (!mm) return null;
+    var plane = XV.ctPlaneFromAxCorSag(pane.axCorSag);
+    var r = XV.ctSwizzleMm(mm, plane);
+    return XV.ctUnswizzleMm([r[0], r[1], isFinite(sliceMm) ? sliceMm : r[2]], plane);
+  }
+
+  function ctCanvasPoint(ev) {
+    var r = ctMarksCanvas.getBoundingClientRect();
+    var sx = r.width ? ctMarksCanvas.width / r.width : 1;
+    var sy = r.height ? ctMarksCanvas.height / r.height : 1;
+    return { x: (ev.clientX - r.left) * sx, y: (ev.clientY - r.top) * sy };
+  }
+
+  /** Is a measuring or markup tool live on the CT tab right now? */
+  function ctToolArmed() {
+    return ctIsCt() && !!tool && tool !== "calibrate" && !!ctVolume();
+  }
+
+  // -------------------------------------------------------- CT gestures
+  /* While a tool is armed, one finger or the pen belongs to the mark being drawn, so Niivue
+   * must not also drag its crosshair with it. Niivue listens for mouse* and touch* on #ctGl
+   * (registerInteractions in niivue.umd.js), so a capture-phase listener one level up on
+   * #ctStage can swallow those events before they ever reach it — and let every one of them
+   * through the moment a second finger lands, which is how pinch and two-finger pan survive.
+   * Our own placement runs off pointer events, which are a separate stream Niivue ignores. */
+  ["mousedown", "mousemove", "mouseup", "touchstart", "touchmove", "touchend"].forEach(function (type) {
+    el("ctStage").addEventListener(type, function (ev) {
+      if (ev.touches) {
+        if (ev.type === "touchstart" && ev.touches.length > 1) ctTouchMulti = true;
+        if (ev.type === "touchend" && ev.touches.length === 0) {
+          var wasMulti = ctTouchMulti;
+          ctTouchMulti = false;
+          if (wasMulti) return;
+        }
+        if (ctTouchMulti) return;
+      }
+      if (!ctToolArmed() || ctMarkPointers.size > 1) return;
+      ev.stopPropagation();
+    }, true);
+  });
+
+  ctGl.addEventListener("pointerdown", function (ev) {
+    var p = ctCanvasPoint(ev);
+    var rec = { start: p, last: p, moved: 0, time: Date.now(), type: ev.pointerType,
+                multi: false, edit: null, stroke: null, pane: -1, anchor: null };
+    ctMarkPointers.set(ev.pointerId, rec);
+    if (ctMarkPointers.size >= 2) {
+      ctMarkPointers.forEach(function (other) { other.multi = true; });
+      ctCancelPlacement();
+      ctRequestMarksDraw();
+      return;
+    }
+    if (!ctToolArmed()) return;
+    try { ctGl.setPointerCapture(ev.pointerId); } catch (e) { /* still tracked below */ }
+    var idx = XV.ctPaneAt(ctPanes(), p.x, p.y);
+    if (idx < 0) return;
+    rec.pane = idx;
+    var view = ctVisibleOnPane(idx);
+    if (!view) return;
+    if (!ctPending.length && !isFreehand() && tool !== "eraser") {
+      var hit = XV.hitTest(view.flat, [p.x, p.y], function (pt) { return pt; },
+        (rec.type === "mouse" ? HIT_RADIUS_MOUSE : HIT_RADIUS_TOUCH) * ctMarksDpr());
+      if (hit) {
+        var mark = ctMarksFor(view.plane)[view.map[hit.markIndex]];
+        rec.edit = {
+          plane: view.plane, index: view.map[hit.markIndex], ptIndex: hit.ptIndex,
+          last: ctMmAt(view.pane, p.x, p.y, mark.meta.sliceMm), pushed: false,
+        };
+        return;
+      }
+    }
+    if (isFreehand()) {
+      var slice = XV.ctPaneProject(view.pane, ctMmAt(view.pane, p.x, p.y)).sliceMm;
+      ctPendingPlane = view.plane;
+      ctPendingSliceMm = slice;
+      rec.stroke = [ctMmAt(view.pane, p.x, p.y, slice)];
+      ctLiveStroke = rec.stroke;
+      ctRequestMarksDraw();
+      return;
+    }
+    if (rec.type === "pen") {
+      var mm = ctMmAt(view.pane, p.x, p.y);
+      ctPendingPlane = view.plane;
+      ctHover = mm;
+      if (!ctPending.length && (XV.POINTS_NEEDED[tool] || 0) === 2) {
+        rec.anchor = mm;
+        ctAnchor = mm;
+      }
+      ctRequestMarksDraw();
+    }
+  });
+
+  ctGl.addEventListener("pointermove", function (ev) {
+    var rec = ctMarkPointers.get(ev.pointerId);
+    if (!rec) { if (ctIsCt()) ctRequestMarksDraw(); return; }
+    var p = ctCanvasPoint(ev);
+    rec.moved += Math.hypot(p.x - rec.last.x, p.y - rec.last.y);
+    rec.last = p;
+    if (rec.multi || ctMarkPointers.size > 1) { ctRequestMarksDraw(); return; }
+    if (!ctToolArmed()) { ctRequestMarksDraw(); return; }
+    var pane = ctPanes()[rec.pane];
+    if (!pane) { ctRequestMarksDraw(); return; }
+    if (rec.edit) {
+      if (!rec.edit.pushed) { ctPushUndo(); rec.edit.pushed = true; }
+      ctDragMark(rec.edit, pane, p);
+      ctRequestMarksDraw();
+      return;
+    }
+    if (rec.stroke) {
+      rec.stroke.push(ctMmAt(pane, p.x, p.y, ctPendingSliceMm));
+      ctRequestMarksDraw();
+      return;
+    }
+    if (rec.type === "pen") {
+      ctHover = ctMmAt(pane, p.x, p.y);
+      ctRequestMarksDraw();
+    }
+  });
+
+  function ctDragMark(edit, pane, p) {
+    var mark = ctMarksFor(edit.plane)[edit.index];
+    if (!mark) return;
+    var to = ctMmAt(pane, p.x, p.y, mark.meta.sliceMm);
+    if (!to || !edit.last) return;
+    if (edit.ptIndex === "label") {
+      var d = [to[0] - edit.last[0], to[1] - edit.last[1], to[2] - edit.last[2]];
+      mark.pts.forEach(function (pt) { pt[0] += d[0]; pt[1] += d[1]; pt[2] += d[2]; });
+    } else {
+      mark.pts[edit.ptIndex] = to;
+    }
+    edit.last = to;
+    updateCtStatus(ctLabelOf(mark, edit.plane));
+  }
+
+  function ctEndPointer(ev) {
+    var rec = ctMarkPointers.get(ev.pointerId);
+    ctMarkPointers.delete(ev.pointerId);
+    var anchored = ctAnchor;
+    ctAnchor = null;
+    ctHover = null;
+    if (!rec || !ctToolArmed()) { ctLiveStroke = null; ctRequestMarksDraw(); return; }
+    var pane = ctPanes()[rec.pane];
+    if (rec.stroke) {
+      ctLiveStroke = null;
+      if (!rec.multi && ctPendingPlane) ctCommitStroke(rec.stroke, ctPendingPlane, ctPendingSliceMm);
+      ctRequestMarksDraw();
+      return;
+    }
+    if (rec.edit) {
+      if (!rec.edit.pushed && rec.edit.ptIndex === "label") {
+        ctShowPopover(rec.edit.plane, rec.edit.index, rec.last);
+      } else {
+        ctScheduleSave();
+      }
+      ctRequestMarksDraw();
+      return;
+    }
+    hidePopover();
+    if (rec.multi || !pane) { ctRequestMarksDraw(); return; }
+    var dpr = ctMarksDpr();
+    var tapped = rec.type === "pen" ||
+      (rec.moved < TAP_SLOP_PX * dpr && Date.now() - rec.time < TAP_MAX_MS);
+    if (!tapped) { ctRequestMarksDraw(); return; }
+    var plane = XV.ctPlaneFromAxCorSag(pane.axCorSag);
+    var here = XV.ctPaneProject(pane, ctMmAt(pane, rec.last.x, rec.last.y));
+    if (!here) { ctRequestMarksDraw(); return; }
+    var slice = here.sliceMm;
+    if (tool === "eraser") { ctEraseAt(rec.pane, rec.last.x, rec.last.y); return; }
+    var mm = ctMmAt(pane, rec.last.x, rec.last.y, slice);
+    var slid = rec.anchor && anchored && !ctPending.length && rec.moved >= TAP_SLOP_PX * dpr;
+    if (slid) {
+      ctAddPoint(ctMmAt(pane, rec.start.x, rec.start.y, slice), plane, slice);
+      ctAddPoint(mm, plane, slice);
+    } else {
+      ctAddPoint(mm, plane, slice);
+    }
+  }
+  ctGl.addEventListener("pointerup", ctEndPointer);
+  ctGl.addEventListener("pointercancel", ctEndPointer);
+  ctGl.addEventListener("wheel", function () { ctRequestMarksDraw(); }, { passive: true });
+
+  // ---------------------------------------------------------- CT popover
+
+  function ctExactValueOf(mark, plane) {
+    var flat = XV.ctFlattenMark(mark, plane);
+    if (mark.type === "angle") return XV.angleDeg(flat.pts[0], flat.pts[1], flat.pts[2], [1, 1]);
+    if (mark.type === "cobb") return XV.cobbAngle(flat.pts, [1, 1]);
+    if (mark.type === "circle") return XV.circleMetrics(flat.pts, [1, 1], true).diameter;
+    return XV.distanceMm(flat.pts[0], flat.pts[1], [1, 1]);
+  }
+
+  /** Put a set of 2-D millimetre points from the maths back on the mark's own plane. */
+  function ctUnflatten(pts, plane, sliceMm) {
+    return pts.map(function (p) { return XV.ctUnswizzleMm([p[0], p[1], sliceMm], plane); });
+  }
+
+  function ctShowPopover(plane, index, at) {
+    var list = ctMarksFor(plane);
+    var m = list[index];
+    if (!m) return;
+    ctPopMark = { plane: plane, index: index };
+    var pop = el("markPop");
+    pop.innerHTML = "";
+    var button = function (text, onclick) {
+      var b = document.createElement("button");
+      b.textContent = text;
+      b.onclick = onclick;
+      return b;
+    };
+    var reshape = function (pts) {
+      m.pts = ctUnflatten(pts, plane, m.meta.sliceMm);
+      updateCtStatus(ctLabelOf(m, plane));
+      ctAfterEdit();
+    };
+    pop.appendChild(button("Delete", function () {
+      ctPushUndo();
+      list.splice(index, 1);
+      ctAfterEdit();
+    }));
+    if (m.type === "angle" || m.type === "cobb") {
+      var snapRow = document.createElement("div");
+      snapRow.className = "row";
+      [1, 5].forEach(function (step) {
+        snapRow.appendChild(button("Snap " + step + "°", function () {
+          ctPushUndo();
+          reshape(XV.setMarkAngle(XV.ctFlattenMark(m, plane),
+            XV.snapAngle(ctExactValueOf(m, plane), step), [1, 1]));
+        }));
+      });
+      pop.appendChild(snapRow);
+    }
+    if (["angle", "cobb", "line", "circle"].indexOf(m.type) >= 0) {
+      var row = document.createElement("div");
+      row.className = "row";
+      var input = document.createElement("input");
+      input.type = "number";
+      input.step = "0.1";
+      input.value = ctExactValueOf(m, plane).toFixed(1);
+      row.appendChild(input);
+      row.appendChild(button("Set", function () {
+        var value = Number(input.value);
+        if (!Number.isFinite(value)) return;
+        ctPushUndo();
+        var flat = XV.ctFlattenMark(m, plane);
+        reshape(m.type === "angle" || m.type === "cobb"
+          ? XV.setMarkAngle(flat, value, [1, 1])
+          : XV.setMarkLength(flat, value, [1, 1], true));
+      }));
+      pop.appendChild(row);
+    }
+    if (m.type === "line") {
+      pop.appendChild(button(m.meta.tiltAxis === "v" ? "Tilt vs horizontal" : "Tilt vs vertical",
+        function () {
+          ctPushUndo();
+          m.meta.tiltAxis = m.meta.tiltAxis === "v" ? "h" : "v";
+          ctAfterEdit();
+        }));
+    }
+    pop.appendChild(button(m.meta.reference ? "Reference ✓" : "Set as reference", function () {
+      ctPushUndo();
+      list.forEach(function (other) { if (other.meta) other.meta.reference = false; });
+      m.meta.reference = true;
+      ctAfterEdit();
+    }));
+    pop.appendChild(button("Close", hidePopover));
+    var dpr = ctMarksDpr();
+    var box = el("ctStage").getBoundingClientRect();
+    pop.classList.add("show");
+    var w = pop.offsetWidth || 170, h = pop.offsetHeight || 180;
+    pop.style.left = Math.max(4, Math.min(at.x / dpr - w / 2, box.width - w - 4)) + "px";
+    pop.style.top = Math.max(4, Math.min(at.y / dpr + 16, box.height - h - 4)) + "px";
+  }
+
+  // ------------------------------------------------------- CT persistence
+
+  function ctMarksRecord() {
+    var uid = ctSeriesUid();
+    var out = {};
+    if (!uid) return out;
+    XV.CT_PANE_PLANES.forEach(function (plane) {
+      var key = XV.ctMarkKey(uid, plane);
+      var list = ctMarkStore[key] || [];
+      if (list.length) out[key] = cloneMarks(list);
+    });
+    return out;
+  }
+
+  function ctScheduleSave() {
+    if (!ctSeriesUid()) return;
+    clearTimeout(ctMarkSaveTimer);
+    ctMarkSaveTimer = setTimeout(function () {
+      ctSaveMeta();
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  /** One record per series: the window it was left at, and its marks, per plane. */
+  function ctSaveMeta() {
+    var uid = ctSeriesUid();
+    if (!uid) return;
+    saveCtMeta({
+      uid: uid, preset: ctPresetKey, width: ctWidth, level: ctLevel, marks: ctMarksRecord(),
+    }).catch(function () { /* full or private: it just will not come back */ });
+  }
+
+  function ctApplyStoredMarks(rec) {
+    if (!rec || !rec.marks) return;
+    Object.keys(rec.marks).forEach(function (key) {
+      if (key.indexOf(String(rec.uid) + "|") !== 0) return;
+      ctMarkStore[key] = cloneMarks(rec.marks[key]);
+    });
+    ctRequestMarksDraw();
+  }
+
+  // ------------------------------------------------------- CT PNG export
+
+  /** The pane on screen: whichever plane a single-pane mode is showing, else the first one. */
+  function ctExportPane() {
+    var want = ctPlaneOf(ctMode);
+    var panes = ctPanes();
+    for (var i = 0; i < panes.length; i++) {
+      if (panes[i].axCorSag > 2) continue;
+      if (!want || XV.ctPlaneFromAxCorSag(panes[i].axCorSag) === want) return panes[i];
+    }
+    return null;
+  }
+
+  /* 4.2: the pane as it is on screen, at canvas resolution, with the overlay on top. The GL
+   * canvas has no preserveDrawingBuffer, so it is redrawn and copied in the same task — after
+   * a return to the event loop its pixels are gone. */
+  function ctExportPng() {
+    var pane = ctExportPane();
+    if (!nv || !pane || !ctVolume()) {
+      ctFail("Nothing to save yet", { message: "open a CT series first" });
+      return;
+    }
+    var ltwh = pane.leftTopWidthHeight;
+    var left = Math.round(ltwh[2] < 0 ? ltwh[0] + ltwh[2] : ltwh[0]);
+    var top = Math.round(ltwh[1]);
+    var w = Math.max(1, Math.round(Math.abs(ltwh[2])));
+    var h = Math.max(1, Math.round(ltwh[3]));
+    var out = document.createElement("canvas");
+    out.width = w;
+    out.height = h;
+    var c = out.getContext("2d");
+    nv.drawScene();
+    ctDrawMarks();
+    c.drawImage(ctGl, left, top, w, h, 0, 0, w, h);
+    c.drawImage(ctMarksCanvas, left, top, w, h, 0, 0, w, h);
+    var series = seriesList[ctIndex];
+    var name = String((series && series.label) || "ct").replace(/[^\w.-]+/g, "-") +
+      "-" + XV.ctPlaneFromAxCorSag(pane.axCorSag) + "-marked.png";
+    out.toBlob(function (blob) {
+      if (!blob) { ctFail("The pane could not be turned into a PNG", { message: "toBlob said no" }); return; }
+      deliverPng(blob, name);
+    }, "image/png");
+  }
+
   // ------------------------------------------------------------- tabs
   // The relief tab lives in a module script (it needs a dynamic import for three.js);
   // it registers itself on window.ReliefTab, so everything here stays optional.
   var activeTab = "2d";
 
+  /* One tool row, one markup row and one popover exist in the page, and they move to whichever
+   * tab is using them — two copies would mean two sets of ids and two sets of state. The move
+   * happens while the CT panel is still hidden, so the CT bar is laid out once at its final
+   * height: a bar that grew afterwards would shrink #ctStage, and a resized Niivue canvas
+   * renders black in WebKit and never recovers (Phase 3 note). For the same reason the markup
+   * row is always open on the CT tab rather than toggled. */
+  function moveSharedRows(name) {
+    var toCt = name === "ct";
+    var tools = el("tools"), markupRow = el("markupTools"), pop = el("markPop");
+    var host = toCt ? el("ctStatus").parentNode : el("controls2dGroup").parentNode;
+    var before = toCt ? el("ctStatus") : el("controls2dGroup");
+    if (tools.parentNode !== host) {
+      host.insertBefore(tools, before);
+      host.insertBefore(markupRow, before);
+    }
+    markupRow.classList.toggle("hide", toCt ? false : !markupOn);
+    var stageHost = toCt ? el("ctStage") : el("stage");
+    if (pop.parentNode !== stageHost) stageHost.appendChild(pop);
+  }
+
   function showTab(name) {
     activeTab = name;
+    moveSharedRows(name);
+    syncUndoButtons();
+    hidePopover();
     el("panel2d").classList.toggle("hide", name !== "2d");
     el("panelRelief").classList.toggle("hide", name !== "relief");
     el("panelCT").classList.toggle("hide", name !== "ct");
@@ -2732,6 +3545,19 @@
     // Phase 2's CT engine reads the grouped series from here.
     series: function () { return seriesList; },
     currentSeries: function () { return ctIndex >= 0 ? seriesList[ctIndex] : null; },
+    /* The CT tab's own state, for the browser checks: the engine, the panes it laid out, the
+     * marks in millimetres and the label any one of them carries. Nothing here is UI — it is
+     * the same reading a person gets off the screen, in numbers a test can compare. */
+    ct: function () {
+      return {
+        engine: nv,
+        panes: ctPanes(),
+        uid: ctSeriesUid(),
+        marks: ctMarkStore,
+        markKey: XV.ctMarkKey,
+        label: function (mark, plane) { return ctLabelOf(mark, plane); },
+      };
+    },
     onFilmChange: null,
     // The relief tab logs its failures here too, so a message survives switching tabs.
     status: function (message) { updateStatus(message); },

@@ -23,7 +23,10 @@ drops everything softer than 300 HU so only bone is left, and one finger turns i
 3–20 mm of slices into one image (**MIP** keeps the brightest voxel, **MinIP** the darkest,
 **Mean** averages), **Cine** plays the slices at 8 a second, **Home** puts the view back. Hold a
 finger still on the image for a moment and it reads out the Hounsfield number under the crosshair
-plus the mean and spread over a 5 mm disc. The window you leave a series on comes back next time.
+plus the mean and spread over a 5 mm disc. The measuring and markup tools work on CT too: a mark
+is placed in millimetres on the pane you drew it on, so it stays on that slice (a small hollow dot
+shows where it passes through the other two planes), and **Save PNG** writes out the pane you are
+looking at. The window you leave a series on comes back next time, and so do its marks.
 
 **Test on the PC.** `node ipad/test.mjs` parses the real AP film and checks the maths against the
 desktop app. To see it: `python -m http.server 8765 --directory ipad`, then open

@@ -2232,6 +2232,147 @@
     return { value: value, mean: sum / count, min: min, max: max, count: count };
   }
 
+  // ------------------------------------------------- CT panes: mm <-> canvas
+  /* 4.1. A CT mark is stored in millimetres of the volume's own RAS space, so it stays on the
+   * anatomy however the panes are zoomed, panned or re-laid-out. Turning that into canvas
+   * pixels is the same arithmetic Niivue does in frac2canvasPos, done here so it can be tested
+   * and so a point off the displayed slice still gets a position (Niivue's own version refuses
+   * anything more than 0.1 mm off-plane, which is exactly the case the projected dot needs).
+   *
+   * A `pane` is one entry of nv.screenSlices, verified against niivue@0.69.0's index.d.ts:2592
+   * — {axCorSag, leftTopWidthHeight, sliceFrac, AxyzMxy, leftTopMM, fovMM}. leftTopWidthHeight
+   * is in device pixels with y measured down from the top, and its width goes negative when the
+   * pane is flipped for radiological convention.
+   */
+  var CT_PANE_PLANES = ["axial", "coronal", "sagittal"];   // Niivue SLICE_TYPE 0, 1, 2
+  var CT_DISTANCE_SUFFIX = "mm";           // a CT is calibrated by the scanner
+
+  function ctPlaneFromAxCorSag(axCorSag) {
+    return CT_PANE_PLANES[axCorSag] || "";
+  }
+
+  /* Millimetres into the pane's own axes: [across, up, through]. Niivue's swizzleVec3MM by
+   * another name — axial shows x across and y up, coronal x across and z up, sagittal y and z. */
+  function ctSwizzleMm(mm, plane) {
+    if (plane === "coronal") return [mm[0], mm[2], mm[1]];
+    if (plane === "sagittal") return [mm[1], mm[2], mm[0]];
+    return [mm[0], mm[1], mm[2]];
+  }
+
+  function ctUnswizzleMm(r, plane) {
+    if (plane === "coronal") return [r[0], r[2], r[1]];
+    if (plane === "sagittal") return [r[2], r[0], r[1]];
+    return [r[0], r[1], r[2]];
+  }
+
+  /** Where the pane's displayed slice sits, in mm, at one place on it — obliquity and all. */
+  function ctPaneSliceMm(pane, across, up) {
+    var a = pane.AxyzMxy;
+    return a[2] + a[4] * (up - a[1]) - a[3] * (across - a[0]);
+  }
+
+  function ctPaneUsable(pane) {
+    return !!(pane && pane.axCorSag <= 2 && pane.AxyzMxy && pane.AxyzMxy.length >= 5 &&
+      pane.leftTopMM && pane.fovMM && pane.fovMM[0] && pane.fovMM[1] && pane.leftTopWidthHeight);
+  }
+
+  /** How many canvas pixels one millimetre covers on this pane. */
+  function ctPanePxPerMm(pane) {
+    return Math.abs(pane.leftTopWidthHeight[2]) / pane.fovMM[0];
+  }
+
+  /* One RAS millimetre point on one pane:
+   *  - x, y   canvas pixels
+   *  - inside is the point within the pane's rectangle
+   *  - offMm  how far the point is off the slice the pane is showing (0 = on it) */
+  function ctPaneProject(pane, mm) {
+    if (!ctPaneUsable(pane)) return null;
+    var plane = ctPlaneFromAxCorSag(pane.axCorSag);
+    var r = ctSwizzleMm(mm, plane);
+    var ltwh = pane.leftTopWidthHeight;
+    var u = (r[0] - pane.leftTopMM[0]) / pane.fovMM[0];
+    var v = (r[1] - pane.leftTopMM[1]) / pane.fovMM[1];
+    var flipped = ltwh[2] < 0;
+    var left = flipped ? ltwh[0] + ltwh[2] : ltwh[0];
+    var width = Math.abs(ltwh[2]);
+    return {
+      plane: plane,
+      x: left + (flipped ? 1 - u : u) * width,
+      y: ltwh[1] + (1 - v) * ltwh[3],
+      u: u, v: v,
+      inside: u >= 0 && u <= 1 && v >= 0 && v <= 1,
+      sliceMm: ctPaneSliceMm(pane, r[0], r[1]),
+      offMm: r[2] - ctPaneSliceMm(pane, r[0], r[1]),
+    };
+  }
+
+  /** The inverse: a canvas pixel back to the RAS millimetre on the pane's displayed slice. */
+  function ctPaneUnproject(pane, x, y) {
+    if (!ctPaneUsable(pane)) return null;
+    var plane = ctPlaneFromAxCorSag(pane.axCorSag);
+    var ltwh = pane.leftTopWidthHeight;
+    var flipped = ltwh[2] < 0;
+    var left = flipped ? ltwh[0] + ltwh[2] : ltwh[0];
+    var width = Math.abs(ltwh[2]) || 1;
+    var u = (x - left) / width;
+    if (flipped) u = 1 - u;
+    var v = 1 - (y - ltwh[1]) / (ltwh[3] || 1);
+    var across = pane.leftTopMM[0] + u * pane.fovMM[0];
+    var up = pane.leftTopMM[1] + v * pane.fovMM[1];
+    return ctUnswizzleMm([across, up, ctPaneSliceMm(pane, across, up)], plane);
+  }
+
+  /** Which pane a canvas pixel is in: an index into screenSlices, or -1 for none. */
+  function ctPaneAt(panes, x, y) {
+    for (var i = 0; i < (panes || []).length; i++) {
+      var pane = panes[i];
+      if (!ctPaneUsable(pane)) continue;
+      var ltwh = pane.leftTopWidthHeight;
+      var left = ltwh[2] < 0 ? ltwh[0] + ltwh[2] : ltwh[0];
+      var width = Math.abs(ltwh[2]);
+      if (x >= left && x <= left + width && y >= ltwh[1] && y <= ltwh[1] + ltwh[3]) return i;
+    }
+    return -1;
+  }
+
+  /** Is a point that far off the pane's slice near enough to draw? */
+  function ctSliceHit(offMm, halfMm) {
+    return isFinite(offMm) && Math.abs(offMm) <= halfMm;
+  }
+
+  /** Where one series' marks for one plane are filed in ctMeta. */
+  function ctMarkKey(uid, plane) {
+    return String(uid) + "|" + String(plane);
+  }
+
+  /* describeMark measures in two dimensions, and a CT mark's points have three — so the mark
+   * handed to it is the same mark flattened onto its own plane's [across, up] millimetre axes.
+   * Those axes are orthonormal, so every length and angle survives the flattening exactly, and
+   * spacing [1, 1] with calibrated true then reads the numbers straight off in millimetres. */
+  function ctFlattenMark(mark, plane) {
+    var meta = {};
+    Object.keys((mark && mark.meta) || {}).forEach(function (k) { meta[k] = mark.meta[k]; });
+    return {
+      id: mark.id,
+      type: mark.type,
+      pts: ((mark && mark.pts) || []).map(function (p) {
+        var r = ctSwizzleMm(p, plane);
+        return [r[0], r[1]];
+      }),
+      meta: meta,
+    };
+  }
+
+  /** A CT mark's label, in millimetres, measured on its own plane.
+   *  A radiograph's millimetres carry "(detector plane — uncalibrated)" because magnification
+   *  makes them a guess; a CT's do not, so that warning is taken back off here. */
+  function ctDescribeMark(mark, plane, opts) {
+    var reference = opts && opts.reference;
+    return describeMark(ctFlattenMark(mark, plane), [1.0, 1.0], true, {
+      reference: reference ? ctFlattenMark(reference, plane) : null,
+    }).split(DISTANCE_SUFFIX).join(CT_DISTANCE_SUFFIX);
+  }
+
   root.XV = {
     DicomLoadError: DicomLoadError,
     ctBudget: ctBudget,
@@ -2250,6 +2391,20 @@
     ctAutoPreset: ctAutoPreset,
     slabProject: slabProject,
     huDisc: huDisc,
+    CT_PANE_PLANES: CT_PANE_PLANES,
+    CT_DISTANCE_SUFFIX: CT_DISTANCE_SUFFIX,
+    ctPlaneFromAxCorSag: ctPlaneFromAxCorSag,
+    ctSwizzleMm: ctSwizzleMm,
+    ctUnswizzleMm: ctUnswizzleMm,
+    ctPaneSliceMm: ctPaneSliceMm,
+    ctPanePxPerMm: ctPanePxPerMm,
+    ctPaneProject: ctPaneProject,
+    ctPaneUnproject: ctPaneUnproject,
+    ctPaneAt: ctPaneAt,
+    ctSliceHit: ctSliceHit,
+    ctMarkKey: ctMarkKey,
+    ctFlattenMark: ctFlattenMark,
+    ctDescribeMark: ctDescribeMark,
     parseDicom: parseDicom,
     displayWindow: displayWindow,
     zipEntries: zipEntries,

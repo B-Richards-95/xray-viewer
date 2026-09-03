@@ -861,5 +861,109 @@ check(
   JSON.stringify(outside)
 );
 
+// ------------------------------------------- 4.1 CT panes: mm <-> canvas pixels
+// One pane of nv.screenSlices, shaped as niivue@0.69.0's index.d.ts:2592 describes it: an axial
+// tile 100 px from the left and 20 px down, 400 px square, showing 200 mm of a volume whose
+// axial slice sits at z = 12 mm.  AxyzMxy is [originAcross, originUp, sliceMM, slopeAcross,
+// slopeUp] — the last two are zero for a slice that is not oblique.
+const axPane = {
+  axCorSag: 0,
+  leftTopWidthHeight: [100, 20, 400, 400],
+  leftTopMM: [-100, -100],
+  fovMM: [200, 200],
+  AxyzMxy: [0, 0, 12, 0, 0],
+};
+check("axial is SLICE_TYPE 0, coronal 1, sagittal 2", XV.ctPlaneFromAxCorSag(0) === "axial" &&
+  XV.ctPlaneFromAxCorSag(1) === "coronal" && XV.ctPlaneFromAxCorSag(2) === "sagittal");
+const centre = XV.ctPaneProject(axPane, [0, 0, 12]);
+check(
+  "the middle of the volume lands in the middle of its pane",
+  near(centre.x, 300) && near(centre.y, 220) && centre.inside && near(centre.offMm, 0),
+  JSON.stringify(centre)
+);
+check(
+  "millimetres up the screen are pixels down it: +y mm goes towards the top",
+  XV.ctPaneProject(axPane, [0, 50, 12]).y < centre.y
+);
+check("2 canvas px to the millimetre on a 400 px, 200 mm pane", near(XV.ctPanePxPerMm(axPane), 2));
+const back = XV.ctPaneUnproject(axPane, 300, 220);
+check("unproject is the inverse of project", back.every((v, i) => near(v, [0, 0, 12][i])),
+  JSON.stringify(back));
+const roundTrip = XV.ctPaneProject(axPane, XV.ctPaneUnproject(axPane, 137, 344));
+check("a canvas pixel round-trips through millimetres unchanged",
+  near(roundTrip.x, 137, 1e-9) && near(roundTrip.y, 344, 1e-9), JSON.stringify(roundTrip));
+
+// Radiological convention hands back a negative width: the pane is the same rectangle, mirrored.
+const flipped = Object.assign({}, axPane, { leftTopWidthHeight: [500, 20, -400, 400] });
+check(
+  "a flipped pane mirrors left and right and keeps up and down",
+  near(XV.ctPaneProject(flipped, [-50, 0, 12]).x, 400) &&
+    near(XV.ctPaneProject(flipped, [50, 0, 12]).x, 200) &&
+    near(XV.ctPaneProject(flipped, [0, 50, 12]).y, XV.ctPaneProject(axPane, [0, 50, 12]).y)
+);
+check("a point outside the pane's field of view says so", !XV.ctPaneProject(axPane, [500, 0, 12]).inside);
+
+const corPane = { axCorSag: 1, leftTopWidthHeight: [0, 0, 400, 400], leftTopMM: [-100, -100],
+  fovMM: [200, 200], AxyzMxy: [0, 0, -30, 0, 0] };
+const sagPane = { axCorSag: 2, leftTopWidthHeight: [0, 0, 400, 400], leftTopMM: [-100, -100],
+  fovMM: [200, 200], AxyzMxy: [0, 0, 7, 0, 0] };
+check("coronal shows x across and z up, and its slice is y",
+  near(XV.ctPaneProject(corPane, [10, -30, 20]).offMm, 0) &&
+  near(XV.ctPaneProject(corPane, [10, -25, 20]).offMm, 5));
+check("sagittal shows y across and z up, and its slice is x",
+  near(XV.ctPaneProject(sagPane, [7, 10, 20]).offMm, 0) &&
+  near(XV.ctPaneProject(sagPane, [9, 10, 20]).offMm, 2));
+check("swizzle and unswizzle undo each other on every plane",
+  ["axial", "coronal", "sagittal"].every((plane) =>
+    XV.ctUnswizzleMm(XV.ctSwizzleMm([1, 2, 3], plane), plane).join(",") === "1,2,3"));
+
+// An oblique slice: AxyzMxy's slopes tilt the plane, so where it sits depends on where you look.
+const tilted = Object.assign({}, axPane, { AxyzMxy: [0, 0, 12, 0.1, 0] });
+check("an oblique pane's slice moves across the pane", near(XV.ctPaneSliceMm(tilted, 10, 0), 11) &&
+  near(XV.ctPaneSliceMm(tilted, -10, 0), 13));
+
+check("which pane a canvas pixel is in", XV.ctPaneAt([corPane, axPane], 450, 300) === 1 &&
+  XV.ctPaneAt([corPane, axPane], 10, 10) === 0 &&
+  XV.ctPaneAt([corPane, axPane], 900, 900) === -1);
+
+// ------------------------------------------------- 4.1 the slice-visibility predicate
+check(
+  "a mark shows while its slice is within half a voxel and not a step further",
+  XV.ctSliceHit(0, 1.5) && XV.ctSliceHit(1.5, 1.5) && XV.ctSliceHit(-1.4, 1.5) &&
+    !XV.ctSliceHit(1.6, 1.5) && !XV.ctSliceHit(NaN, 1.5)
+);
+check(
+  "the projected dot's 1 mm reach is the same predicate, asked for less",
+  XV.ctSliceHit(0.9, 1) && !XV.ctSliceHit(1.1, 1)
+);
+
+// ------------------------------------------- 4.1 describeMark on three-component mm points
+// A 30-40-50 triangle laid on the axial plane: the flattened mark must read 50 mm, whatever
+// the slice coordinate is, and the same shape stood up on coronal must read the same.
+const axLine = { id: "a", type: "line", pts: [[0, 0, 12], [30, 40, 12]], meta: { plane: "axial", sliceMm: 12 } };
+check("a CT line reads its true length in mm off three-component points",
+  XV.ctDescribeMark(axLine, "axial").startsWith("50.0 mm"), XV.ctDescribeMark(axLine, "axial"));
+const corLine = { id: "b", type: "line", pts: [[0, -30, 0], [30, -30, 40]], meta: { plane: "coronal", sliceMm: -30 } };
+check("the same triangle on coronal reads the same 50 mm",
+  XV.ctDescribeMark(corLine, "coronal").startsWith("50.0 mm"), XV.ctDescribeMark(corLine, "coronal"));
+check(
+  "flattening drops the through-plane axis and keeps the two the pane shows",
+  XV.ctFlattenMark(corLine, "coronal").pts.map((p) => p.join(",")).join(" | ") === "0,0 | 30,40"
+);
+const axAngle = { id: "c", type: "angle", pts: [[10, 0, 5], [0, 0, 5], [0, 10, 5]], meta: { plane: "axial", sliceMm: 5 } };
+check("a CT angle reads 90 degrees", XV.ctDescribeMark(axAngle, "axial") === "90.0°",
+  XV.ctDescribeMark(axAngle, "axial"));
+check("a CT circle reads its diameter in mm",
+  XV.ctDescribeMark({ id: "d", type: "circle", pts: [[0, 0, 1], [3, 4, 1]], meta: {} }, "axial") ===
+    "\u2300 10.0 \u00b7 r 5.0 mm");
+check("markup on CT carries no measurement",
+  XV.ctDescribeMark({ id: "e", type: "ink", pts: [[0, 0, 0], [1, 1, 0]], meta: {} }, "axial") === "");
+
+// -------------------------------------------------------- 4.1 the persistence key
+check("marks are filed under the series and the plane they belong to",
+  XV.ctMarkKey("1.2.840.113619.2", "axial") === "1.2.840.113619.2|axial" &&
+    XV.ctMarkKey("1.2.840.113619.2", "coronal") !== XV.ctMarkKey("1.2.840.113619.2", "axial") &&
+    XV.ctMarkKey("other", "axial") !== XV.ctMarkKey("1.2.840.113619.2", "axial"));
+
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
