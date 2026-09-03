@@ -2042,6 +2042,196 @@
     return bytes;
   }
 
+  // ------------------------------------------------ CT windows, modes, probe
+  /* A CT is stored in Hounsfield units over a range no screen can show at once, so a window
+   * picks the slice of that range to spend all 256 greys on: width W around level L shows
+   * L - W/2 as black and L + W/2 as white. Niivue calls that pair cal_min and cal_max.
+   * The four presets are OHIF's own numbers (research §4), each labelled in plain words
+   * because "1800/400" says nothing until somebody tells you it means bone. */
+  var CT_PRESETS = [
+    { key: "bone", name: "Bone", hint: "cortex, fractures", width: 1800, level: 400 },
+    { key: "soft", name: "Soft tissue", hint: "muscle, fluid", width: 350, level: 50 },
+    { key: "lung", name: "Lung", hint: "airways, air spaces", width: 1500, level: -600 },
+    { key: "brain", name: "Brain", hint: "grey and white", width: 80, level: 40 },
+  ];
+  // Slider ends: the widest window worth having, and the HU range a 12-bit CT can hold.
+  var CT_WINDOW_LIMITS = { widthMin: 1, widthMax: 4000, levelMin: -1024, levelMax: 3071 };
+
+  /** @returns {?{key: string, name: string, hint: string, width: number, level: number}} */
+  function ctPreset(key) {
+    for (var i = 0; i < CT_PRESETS.length; i++) if (CT_PRESETS[i].key === key) return CT_PRESETS[i];
+    return null;
+  }
+
+  /** Window width and level -> the cal_min / cal_max pair Niivue renders between. */
+  function ctWindowRange(width, level) {
+    var w = Number(width);
+    var l = Number(level);
+    if (!isFinite(w) || w <= 0) w = CT_WINDOW_LIMITS.widthMin;
+    if (!isFinite(l)) l = 0;
+    return { min: l - w / 2, max: l + w / 2 };
+  }
+
+  /** The inverse, for reading a window back off a volume Niivue windowed itself. */
+  function ctWindowFromRange(min, max) {
+    var lo = Number(min), hi = Number(max);
+    if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return { width: CT_WINDOW_LIMITS.widthMin, level: 0 };
+    return { width: hi - lo, level: (lo + hi) / 2 };
+  }
+
+  /* Which preset a series wants, read off the two tags that say what was scanned. Bone is
+   * tested first on purpose: "skull" matches both the bone list and the brain one, and a skull
+   * series is asked for to look at bone. */
+  var CT_AUTO_RULES = [
+    { key: "bone", test: /bone|extremity|elbow|wrist|knee|spine|skull|hand|foot/i },
+    { key: "lung", test: /lung|chest|thorax/i },
+    { key: "brain", test: /head|brain/i },
+  ];
+
+  /**
+   * @param {{bodyPart?: string, description?: string}} series
+   * @returns {{key: string, matched: string, text: string}} matched is the word that decided it
+   */
+  function ctAutoPreset(series) {
+    var text = [(series && series.bodyPart) || "", (series && series.description) || ""]
+      .filter(Boolean).join(" ");
+    for (var i = 0; i < CT_AUTO_RULES.length; i++) {
+      var hit = CT_AUTO_RULES[i].test.exec(text);
+      if (hit) return { key: CT_AUTO_RULES[i].key, matched: hit[0], text: text };
+    }
+    return { key: "soft", matched: "", text: text };
+  }
+
+  /* Which axis each anatomical plane scrolls along, once the voxels are in RAS order: x runs
+   * left to right, so it is what a sagittal slice steps through; y runs back to front, coronal;
+   * z runs foot to head, axial. A CT does not have to arrive stored that way — a coronal
+   * acquisition or a reformat does not — so the CT tab reads and writes its voxels through
+   * Niivue's own NVImage.getVolumeData / setVolumeData, which are documented as taking RAS
+   * coordinates and which walk the raw array through img2RASstep/img2RASstart on the way.
+   * That is also the space Niivue's frac2vox crosshair lives in. */
+  var CT_PLANE_AXIS = { sagittal: 0, coronal: 1, axial: 2 };
+
+  var CT_SLAB_MM = [0, 3, 5, 10, 20];        // the select's thicknesses; 0 is off
+  var CT_SLAB_MODES = [
+    { key: "max", name: "MIP" },             // brightest voxel in the slab: bone and contrast
+    { key: "min", name: "MinIP" },           // darkest: air, airways
+    { key: "mean", name: "Mean" },           // averaged: quieter noise
+  ];
+
+  /**
+   * A thick-slice projection along one voxel axis: every voxel becomes the max, min or mean of
+   * the ±half voxels either side of it on its own line.
+   *
+   * ponytail: Niivue 0.69 has no thick-slab projection of its own — the string "MIP" does not
+   * occur anywhere in niivue.umd.js — so this is the CPU path, run in ct-worker.js and written
+   * back into NVImage.img before updateGLVolume(). If Niivue ever ships one, delete this.
+   *
+   * @param {ArrayLike<number>} img raw voxels, x fastest
+   * @param {number[]} dims [nx, ny, nz]
+   * @param {number} axis 0, 1 or 2 — the voxel axis the slab is thick along
+   * @param {number} half voxels either side of the centre one
+   * @param {string} mode "max", "min" or "mean"
+   * @returns {ArrayLike<number>} a fresh array of the same type
+   */
+  function slabProject(img, dims, axis, half, mode) {
+    var nx = Math.max(1, dims[0] | 0), ny = Math.max(1, dims[1] | 0), nz = Math.max(1, dims[2] | 0);
+    var n = nx * ny * nz;
+    var out = new img.constructor(n);
+    var h = Math.max(0, Math.floor(Number(half) || 0));
+    if (h === 0) {
+      for (var q = 0; q < n; q++) out[q] = img[q];
+      return out;
+    }
+    var strides = [1, nx, nx * ny];
+    var counts = [nx, ny, nz];
+    var ax = axis === 0 || axis === 1 ? axis : 2;
+    var other = [0, 1, 2].filter(function (a) { return a !== ax; });
+    var step = strides[ax], span = counts[ax];
+    var sA = strides[other[0]], cA = counts[other[0]];
+    var sB = strides[other[1]], cB = counts[other[1]];
+    var integer = !(img instanceof Float32Array || img instanceof Float64Array);
+    for (var b = 0; b < cB; b++) {
+      for (var a2 = 0; a2 < cA; a2++) {
+        var base = b * sB + a2 * sA;
+        for (var k = 0; k < span; k++) {
+          var lo = k - h < 0 ? 0 : k - h;
+          var hi = k + h > span - 1 ? span - 1 : k + h;
+          var acc, i, v;
+          if (mode === "min") {
+            acc = Infinity;
+            for (i = lo; i <= hi; i++) { v = img[base + i * step]; if (v < acc) acc = v; }
+          } else if (mode === "mean") {
+            acc = 0;
+            for (i = lo; i <= hi; i++) acc += img[base + i * step];
+            acc /= (hi - lo + 1);
+            if (integer) acc = Math.round(acc);
+          } else {
+            acc = -Infinity;
+            for (i = lo; i <= hi; i++) { v = img[base + i * step]; if (v > acc) acc = v; }
+          }
+          out[base + k * step] = acc;
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The voxel value at a point, and the mean/min/max over a disc of the given radius drawn
+   * round it in one plane. The disc is in millimetres, so an anisotropic volume gets an
+   * ellipse of voxels, which is the same circle on screen.
+   *
+   * These are raw stored values: multiply by the NIfTI scl_slope and add scl_inter at the call
+   * site to read Hounsfield units. That scaling is linear, so it can be applied to value, mean,
+   * min and max after the fact (swapping min and max if the slope is negative).
+   *
+   * @param {ArrayLike<number>} img raw voxels, x fastest
+   * @param {number[]} dims [nx, ny, nz]
+   * @param {number[]} pixdims millimetres per voxel along each of those axes
+   * @param {number[]} centerVox [i, j, k]; rounded, and clamped into the volume
+   * @param {number|string} plane the voxel axis the disc is normal to (0/1/2), or one of
+   *   "sagittal" / "coronal" / "axial" for the usual i/j/k order
+   * @param {number} radiusMm
+   * @returns {{value: number, mean: number, min: number, max: number, count: number}}
+   */
+  function huDisc(img, dims, pixdims, centerVox, plane, radiusMm) {
+    var nx = Math.max(1, dims[0] | 0), ny = Math.max(1, dims[1] | 0), nz = Math.max(1, dims[2] | 0);
+    var counts = [nx, ny, nz];
+    var strides = [1, nx, nx * ny];
+    var ax = typeof plane === "number" ? plane : CT_PLANE_AXIS[String(plane)];
+    if (ax !== 0 && ax !== 1 && ax !== 2) ax = 2;
+    var other = [0, 1, 2].filter(function (a) { return a !== ax; });
+    var c = [0, 1, 2].map(function (a) {
+      var v = Math.round(Number((centerVox && centerVox[a]) || 0));
+      return v < 0 ? 0 : v > counts[a] - 1 ? counts[a] - 1 : v;
+    });
+    var r = Math.max(0, Number(radiusMm) || 0);
+    var mmA = Math.abs(Number(pixdims && pixdims[other[0]]) || 1) || 1;
+    var mmB = Math.abs(Number(pixdims && pixdims[other[1]]) || 1) || 1;
+    var spanA = Math.floor(r / mmA), spanB = Math.floor(r / mmB);
+    var fixed = c[ax] * strides[ax];
+    var value = img[fixed + c[other[0]] * strides[other[0]] + c[other[1]] * strides[other[1]]];
+    var sum = 0, count = 0, min = Infinity, max = -Infinity;
+    for (var db = -spanB; db <= spanB; db++) {
+      var b = c[other[1]] + db;
+      if (b < 0 || b > counts[other[1]] - 1) continue;
+      var offB = db * mmB;
+      for (var da = -spanA; da <= spanA; da++) {
+        var a = c[other[0]] + da;
+        if (a < 0 || a > counts[other[0]] - 1) continue;
+        var offA = da * mmA;
+        if (offA * offA + offB * offB > r * r) continue;
+        var v = img[fixed + a * strides[other[0]] + b * strides[other[1]]];
+        sum += v;
+        count += 1;
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+    }
+    if (!count) return { value: value, mean: NaN, min: NaN, max: NaN, count: 0 };
+    return { value: value, mean: sum / count, min: min, max: max, count: count };
+  }
+
   root.XV = {
     DicomLoadError: DicomLoadError,
     ctBudget: ctBudget,
@@ -2049,6 +2239,17 @@
     decimateNiftiInPlane: decimateNiftiInPlane,
     CT_MAX_VOXELS: CT_MAX_VOXELS,
     CT_MAX_FACTOR: CT_MAX_FACTOR,
+    CT_PRESETS: CT_PRESETS,
+    CT_WINDOW_LIMITS: CT_WINDOW_LIMITS,
+    CT_PLANE_AXIS: CT_PLANE_AXIS,
+    CT_SLAB_MM: CT_SLAB_MM,
+    CT_SLAB_MODES: CT_SLAB_MODES,
+    ctPreset: ctPreset,
+    ctWindowRange: ctWindowRange,
+    ctWindowFromRange: ctWindowFromRange,
+    ctAutoPreset: ctAutoPreset,
+    slabProject: slabProject,
+    huDisc: huDisc,
     parseDicom: parseDicom,
     displayWindow: displayWindow,
     zipEntries: zipEntries,

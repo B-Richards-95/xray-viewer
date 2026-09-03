@@ -5,13 +5,25 @@ Formerly “X-ray viewer” — the repo and the URL keep the old name.
 Offline web viewer for my own scans: 2D windowing, measuring, markup on X-rays, plus an
 intensity relief with **Smooth**, **Detail** and **Rounding** presets and an **Auto** button that
 reads all three off the film itself (Rounding is what stops a bone shaft reading as a trough
-between its two bright edges). No build step, no framework — `index.html`, `viewer-core.js` and
-`relief-worker.js` are the app.
+between its two bright edges), plus a CT tab. No build step, no framework — `index.html`,
+`viewer-core.js` and the three workers are the app.
 
 **Relief.** Tap Build, or tap the empty black stage. **Mesh** is the grid size (512² default,
 1024² for detail), **Smooth / Detail / Rounding** match the desktop presets, **Auto** picks all
 three from the film and switches itself off when you change one by hand. One finger orbits, two
 fingers zoom and pan, **Home** resets the view, **Invert** flips the shading.
+
+**CT.** The CT tab opens a whole series — a folder of `.dcm` files or one `.zip` — and renders it
+with Niivue. **Window** buttons set the grey range in plain words (**Bone** for cortex and
+fractures, **Soft tissue** for muscle and fluid, **Lung**, **Brain**), or use the Window / Level
+sliders; **Auto** reads the choice off what the series says was scanned and hangs it the
+radiological way round. **Slices** shows all three planes plus the 3-D render, **Axial /
+Coronal / Sagittal** blow one up on its own, **3-D** shows the render alone — with **Bone** on it
+drops everything softer than 300 HU so only bone is left, and one finger turns it. **Slab** adds
+3–20 mm of slices into one image (**MIP** keeps the brightest voxel, **MinIP** the darkest,
+**Mean** averages), **Cine** plays the slices at 8 a second, **Home** puts the view back. Hold a
+finger still on the image for a moment and it reads out the Hounsfield number under the crosshair
+plus the mean and spread over a 5 mm disc. The window you leave a series on comes back next time.
 
 **Test on the PC.** `node ipad/test.mjs` parses the real AP film and checks the maths against the
 desktop app. To see it: `python -m http.server 8765 --directory ipad`, then open

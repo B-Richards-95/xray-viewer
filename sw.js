@@ -1,12 +1,13 @@
 /* Service worker: cache-first app shell, so the viewer opens with no network at all.
  * Bump CACHE whenever any shell file changes — the version string is what evicts the old copy. */
-var CACHE = "xray-ipad-v12";
+var CACHE = "xray-ipad-v13";
 
 var SHELL = [
   "./",
   "./index.html",
   "./viewer-core.js",
   "./relief-worker.js",
+  "./ct-worker.js",
   "./unzip-worker.js",
   "./manifest.webmanifest",
   "./icon-192.png",

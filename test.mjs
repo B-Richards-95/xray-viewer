@@ -725,5 +725,141 @@ new DataView(bare).setInt16(254, 0, true);
 try { XV.decimateNiftiInPlane(bare, 2); } catch (e) { noSform = e.message; }
 check("a volume with no sform is refused rather than mis-oriented", noSform.includes("sform"), noSform);
 
+// ------------------------------------ CT windows, Auto, slab, probe (Phase 3)
+const bone = XV.ctPreset("bone");
+check(
+  "the Bone preset is OHIF's 1800/400 and says what it is for in plain words",
+  bone.width === 1800 && bone.level === 400 && bone.hint === "cortex, fractures",
+  `${bone.width}/${bone.level} — ${bone.hint}`
+);
+check(
+  "every preset carries a name and a hint",
+  XV.CT_PRESETS.length === 4 && XV.CT_PRESETS.every((p) => p.name && p.hint && p.width > 0),
+  XV.CT_PRESETS.map((p) => p.key).join(",")
+);
+const boneRange = XV.ctWindowRange(bone.width, bone.level);
+check(
+  "window 1800 at level 400 spans −500 to 1300 HU",
+  near(boneRange.min, -500) && near(boneRange.max, 1300),
+  `${boneRange.min} to ${boneRange.max}`
+);
+const lungRange = XV.ctWindowRange(1500, -600);
+check(
+  "the Lung window's negative level still brackets it",
+  near(lungRange.min, -1350) && near(lungRange.max, 150),
+  `${lungRange.min} to ${lungRange.max}`
+);
+check(
+  "a width of zero or a missing level cannot make an inverted range",
+  XV.ctWindowRange(0, 40).max > XV.ctWindowRange(0, 40).min &&
+    Number.isFinite(XV.ctWindowRange(80, NaN).min),
+  JSON.stringify(XV.ctWindowRange(0, 40))
+);
+const backAgain = XV.ctWindowFromRange(boneRange.min, boneRange.max);
+check(
+  "reading a window back off a cal_min/cal_max pair round-trips",
+  near(backAgain.width, 1800) && near(backAgain.level, 400),
+  `${backAgain.width}/${backAgain.level}`
+);
+
+// the Auto picker's whole table, one row per rule plus the fall-through
+[
+  [{ bodyPart: "ELBOW", description: "AbdSeq 2.0 B70f" }, "bone", "ELBOW"],
+  [{ bodyPart: "", description: "Wrist 0.6 bone kernel" }, "bone", "Wrist"],
+  [{ bodyPart: "SKULL", description: "head routine" }, "bone", "SKULL"],
+  [{ bodyPart: "CHEST", description: "" }, "lung", "CHEST"],
+  [{ bodyPart: "", description: "Thorax 1.0" }, "lung", "Thorax"],
+  [{ bodyPart: "HEAD", description: "brain 3.0" }, "brain", "HEAD"],
+  [{ bodyPart: "ABDOMEN", description: "Abdomen 3.0 B30f" }, "soft", ""],
+  [{}, "soft", ""],
+].forEach(([series, want, matched]) => {
+  const got = XV.ctAutoPreset(series);
+  check(
+    `Auto picks ${want} for "${[series.bodyPart, series.description].filter(Boolean).join(" ")}"`,
+    got.key === want && got.matched === matched,
+    `${got.key} from "${got.matched}"`
+  );
+});
+
+// slab: a 1×1×7 column of a ramp, projected three ways over ±1 voxel
+const column = Int16Array.from([0, 10, 20, 30, 20, 10, 0]);
+const maxed = XV.slabProject(column, [1, 1, 7], 2, 1, "max");
+const minned = XV.slabProject(column, [1, 1, 7], 2, 1, "min");
+const meaned = XV.slabProject(column, [1, 1, 7], 2, 1, "mean");
+check(
+  "a 3-voxel MIP keeps the brightest neighbour and clamps at both ends",
+  Array.from(maxed).join(",") === "10,20,30,30,30,20,10",
+  Array.from(maxed).join(",")
+);
+check(
+  "MinIP keeps the darkest",
+  Array.from(minned).join(",") === "0,0,10,20,10,0,0",
+  Array.from(minned).join(",")
+);
+check(
+  "Mean averages, rounded back into the integer the volume stores",
+  Array.from(meaned).join(",") === "5,10,20,23,20,10,5",
+  Array.from(meaned).join(",")
+);
+check(
+  "a slab of zero thickness is the volume unchanged, in a fresh array",
+  XV.slabProject(column, [1, 1, 7], 2, 0, "max") instanceof Int16Array &&
+    Array.from(XV.slabProject(column, [1, 1, 7], 2, 0, "max")).join(",") === Array.from(column).join(","),
+  "ok"
+);
+// the same ramp laid along x instead: the projection must follow the axis it is told, not the
+// memory order, or a sagittal slab would silently project through the axial stack.
+const row = Int16Array.from([0, 10, 20, 30, 20, 10, 0]);
+check(
+  "the axis argument picks the direction the slab is thick along",
+  Array.from(XV.slabProject(row, [7, 1, 1], 0, 1, "max")).join(",") === "10,20,30,30,30,20,10",
+  Array.from(XV.slabProject(row, [7, 1, 1], 0, 1, "max")).join(",")
+);
+
+// HU probe on a synthetic volume: value = the column index, so a disc round the middle has a
+// known mean, min and max, and the count is the lattice points inside the circle.
+const DISC_N = 21, DISC_Z = 5;
+const discVol = new Int16Array(DISC_N * DISC_N * DISC_Z);
+for (let z = 0; z < DISC_Z; z++) {
+  for (let y = 0; y < DISC_N; y++) {
+    for (let x = 0; x < DISC_N; x++) discVol[x + y * DISC_N + z * DISC_N * DISC_N] = x;
+  }
+}
+const disc = XV.huDisc(discVol, [DISC_N, DISC_N, DISC_Z], [1, 1, 1], [10, 10, 2], "axial", 2);
+check(
+  "a 2 mm disc on 1 mm voxels covers the 13 lattice points inside the circle",
+  disc.count === 13,
+  `count=${disc.count}`
+);
+check(
+  "the probe reads the centre voxel, and the disc's mean, min and max around it",
+  disc.value === 10 && near(disc.mean, 10) && disc.min === 8 && disc.max === 12,
+  JSON.stringify(disc)
+);
+const wide2 = XV.huDisc(discVol, [DISC_N, DISC_N, DISC_Z], [2, 1, 1], [10, 10, 2], "axial", 2);
+check(
+  "2 mm-wide voxels halve how far the same 2 mm disc reaches in x",
+  wide2.min === 9 && wide2.max === 11,
+  JSON.stringify(wide2)
+);
+const sag = XV.huDisc(discVol, [DISC_N, DISC_N, DISC_Z], [1, 1, 1], [10, 10, 2], "sagittal", 2);
+check(
+  "a sagittal disc holds x still, so every voxel in it reads the same",
+  sag.min === 10 && sag.max === 10 && sag.count > 1,
+  JSON.stringify(sag)
+);
+const discEdge = XV.huDisc(discVol, [DISC_N, DISC_N, DISC_Z], [1, 1, 1], [0, 0, 0], "axial", 2);
+check(
+  "a disc at the volume's corner is clipped rather than reading off the end",
+  discEdge.count === 6 && discEdge.min === 0 && discEdge.max === 2 && Number.isFinite(discEdge.mean),
+  JSON.stringify(discEdge)
+);
+const outside = XV.huDisc(discVol, [DISC_N, DISC_N, DISC_Z], [1, 1, 1], [999, -5, 99], "axial", 0);
+check(
+  "a centre outside the volume is clamped into it, not indexed off the end",
+  outside.value === DISC_N - 1 && outside.count === 1,
+  JSON.stringify(outside)
+);
+
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

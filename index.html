@@ -116,6 +116,37 @@
   .swatch { padding: 0; width: var(--tap); border-radius: 12px; border: 2px solid var(--line); }
   .swatch[aria-pressed="true"] { border-color: var(--ink); border-width: 3px; }
 
+  /* The CT tab's two scrolling rows — windows, then viewing modes — built like #tools: one
+     row that never wraps and slides sideways when the screen is too narrow. */
+  #ctPresets, #ctModes { display: flex; gap: 6px; flex: 1 1 100%; align-items: center;
+    overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  #ctPresets button, #ctModes button { flex: 0 0 auto; padding: 0 12px; white-space: nowrap; }
+  #ctPresets select, #ctModes select, #ctModes span { flex: 0 0 auto; white-space: nowrap; }
+  #ctModes span { color: var(--ink-dim); font-size: 13px; }
+  /* Each window says in plain words what it is for, under its name: "1800/400" means nothing
+     until somebody tells you it means bone.
+     The fixed height is load-bearing, not taste. A pressed button turns bold, a bold two-line
+     label is taller, and a taller row makes the bar taller and #ctStage shorter — which
+     resizes the WebGL canvas, and WebKit renders a resized Niivue canvas black and never
+     recovers (measured 2026-09-03, iPad Pro 11 emulation: 778 -> 760 px and the pane died).
+     Nothing in this bar may change height. #ctStatus below is pinned to one line for the
+     same reason: it grows a phrase every time a slab or an Auto pick is added. */
+  #ctPresets button { flex-direction: column; gap: 0; line-height: 1.15; height: 52px; }
+  #ctPresets small { font-size: 11px; font-weight: 400; opacity: .7; }
+  #ctStatus { white-space: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  #ctWidthValue, #ctLevelValue { color: var(--ink-dim); font-size: 13px;
+    min-width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  #ctProbe {
+    position: absolute; z-index: 5; display: none; pointer-events: none;
+    padding: 8px 10px; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 12px; box-shadow: 0 6px 24px rgba(0, 0, 0, .55);
+    font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  #ctProbe.show { display: block; }
+  #ctProbe b { color: var(--accent); }
+  #ctProbe div { color: var(--ink-dim); font-size: 12px; }
+
   #markPop, #calibPop {
     position: absolute; z-index: 5; display: none; flex-direction: column; gap: 6px;
     padding: 8px; min-width: 160px;
@@ -262,8 +293,34 @@
     <!-- The CT engine draws here; #ctCanvas above is the one-slice fallback when it cannot. -->
     <canvas id="ctGl" class="idle"></canvas>
     <div id="ctMessage">No CT or MR series open yet.</div>
+    <div id="ctProbe"></div>
   </div>
   <div id="controls">
+    <!-- The window buttons are built from XV.CT_PRESETS so the numbers live in one place. -->
+    <div id="ctPresets"></div>
+    <div class="slider">
+      <label for="ctWidth">Window</label>
+      <input id="ctWidth" type="range" min="1" max="4000" step="10" value="350">
+      <span id="ctWidthValue">350</span>
+    </div>
+    <div class="slider">
+      <label for="ctLevel">Level</label>
+      <input id="ctLevel" type="range" min="-1024" max="3071" step="10" value="50">
+      <span id="ctLevelValue">50</span>
+    </div>
+    <div id="ctModes">
+      <button id="ctModeSlices" aria-pressed="true" title="All three planes and the 3-D render, four to a screen.">Slices</button>
+      <button id="ctModeAxial" aria-pressed="false" title="Axial only, one large pane — looking up from the feet.">Axial</button>
+      <button id="ctModeCoronal" aria-pressed="false" title="Coronal only, one large pane — looking from the front.">Coronal</button>
+      <button id="ctModeSagittal" aria-pressed="false" title="Sagittal only, one large pane — looking from the side.">Sagittal</button>
+      <button id="ctMode3d" aria-pressed="false" title="The 3-D render on its own. One finger turns it.">3-D</button>
+      <button id="ctBone" aria-pressed="false" title="3-D: show bone only — everything below 300 HU goes transparent.">Bone</button>
+      <button id="ctCine" aria-pressed="false" title="Play the slices of the single pane at 8 a second.">Cine</button>
+      <button id="ctHome" title="Put the camera, the zoom and the crosshair back where they started.">Home</button>
+      <span>Slab</span>
+      <select id="ctSlab" title="Add up several slices into one thicker image."></select>
+      <select id="ctSlabMode" title="MIP keeps the brightest voxel of the slab, MinIP the darkest, Mean the average."></select>
+    </div>
     <div class="group">
       <span style="color:var(--ink-dim);font-size:13px">Series</span>
       <select id="ctSeries"></select>
@@ -336,7 +393,10 @@
   // bytes means a re-parse always agrees with a fresh Open of the same file.
   // The second store, filmMeta, is keyed by the same file name as the blob store and holds
   // everything the viewer adds to a film: its manual calibration and its marks.
-  var DB_NAME = "xray-ipad", DB_STORE = "files", DB_META = "filmMeta", DB_VERSION = 2;
+  // The third store, ctMeta, is the same idea one level up: keyed by SeriesInstanceUID, it
+  // holds what the CT tab adds to a series — so far the window it was last read at.
+  var DB_NAME = "xray-ipad", DB_STORE = "files", DB_META = "filmMeta", DB_CT = "ctMeta";
+  var DB_VERSION = 3;
 
   function openDb() {
     return new Promise(function (resolve, reject) {
@@ -344,6 +404,7 @@
       req.onupgradeneeded = function () {
         if (!req.result.objectStoreNames.contains(DB_STORE)) req.result.createObjectStore(DB_STORE);
         if (!req.result.objectStoreNames.contains(DB_META)) req.result.createObjectStore(DB_META);
+        if (!req.result.objectStoreNames.contains(DB_CT)) req.result.createObjectStore(DB_CT);
       };
       req.onsuccess = function () { resolve(req.result); };
       req.onerror = function () { reject(req.error); };
@@ -379,10 +440,24 @@
     return dbTx(DB_META, "readonly", function (store) { return store.getAll(); }).catch(function () { return []; });
   }
 
+  function saveCtMeta(record) {
+    return dbTx(DB_CT, "readwrite", function (store) { store.put(record, record.uid); });
+  }
+
+  /* dbTx unwraps a request by its .result, and a get() that found nothing has result
+   * undefined — so what comes back for an unknown series is the IDBRequest itself, not a
+   * miss. Only something carrying the uid it was filed under is a record. */
+  function loadCtMeta(uid) {
+    return dbTx(DB_CT, "readonly", function (store) { return store.get(uid); })
+      .then(function (rec) { return rec && rec.uid === uid ? rec : null; })
+      .catch(function () { return null; });
+  }
+
   function clearStore() {
     return Promise.all([
       dbTx(DB_STORE, "readwrite", function (store) { store.clear(); }),
       dbTx(DB_META, "readwrite", function (store) { store.clear(); }),
+      dbTx(DB_CT, "readwrite", function (store) { store.clear(); }),
     ]);
   }
 
@@ -1667,6 +1742,37 @@
   var ctVolumeNote = "";     // what the memory guard did, if anything
   var ctWhere = null;        // the last onLocationChange payload
 
+  // Phase 3: windows, viewing modes, slab, cine, HU probe.
+  var CT_PROBE_HOLD_MS = 350;      // shorter than this and a slow tap would pop the readout
+  var CT_PROBE_RADIUS_MM = 5;
+  var CT_CINE_FPS = 8;
+  var CT_BONE_3D = { width: 1500, level: 1050 };   // 300 to 1800 HU: soft tissue drops out
+  var CT_MODES = ["slices", "axial", "coronal", "sagittal", "render"];
+  var CT_MODE_BUTTON = {
+    slices: "ctModeSlices", axial: "ctModeAxial", coronal: "ctModeCoronal",
+    sagittal: "ctModeSagittal", render: "ctMode3d",
+  };
+  var CT_MODE_NAME = {
+    slices: "all four panes", axial: "axial only", coronal: "coronal only",
+    sagittal: "sagittal only", render: "3-D only",
+  };
+
+  var ctMode = "slices";
+  var ctPresetKey = "";
+  var ctWidth = 350, ctLevel = 50;
+  var ctSlabMm = 0, ctSlabMode = "max";
+  var ctBone = false;
+  var ctCineTimer = null;
+  var ctPristine = null;     // the real voxels in RAS order, kept only while a slab is on
+  var ctSlabWorker;          // undefined = not tried, null = tried and could not start
+  var ctSlabJobs = {};
+  var ctSlabToken = 0;
+  var ctSlabNote = "";
+  var ctAutoNote = "";
+  var ctHomeView = null;     // camera, zoom and pan as the engine first set them
+  var ctWindowSaveTimer = null;
+  var ctHold = null;         // the tap-and-hold in progress, if any
+
   function ctMessage(text) { el("ctMessage").textContent = text || ""; }
 
   /* Nothing about a black panel says why it is black, so every route a failure can take — a
@@ -1879,6 +1985,14 @@
       };
       return instance.attachToCanvas(ctGl).then(function () {
         nv = instance;
+        // Home has to put the camera back where the engine chose to start it, and the engine's
+        // own defaults are the only honest answer to "where was that".
+        ctHomeView = {
+          azimuth: nv.scene.renderAzimuth,
+          elevation: nv.scene.renderElevation,
+          zoom: nv.scene.volScaleMultiplier,
+          pan: Array.prototype.slice.call(nv.scene.pan2Dxyzmm),
+        };
         return nv;
       });
     });
@@ -1926,14 +2040,25 @@
       if (!image || stale()) return null;
       nv.volumes.slice().forEach(function (old) { nv.removeVolume(old); });
       nv.addVolume(image);
-      nv.setSliceType(ctEngine.SLICE_TYPE.MULTIPLANAR);
       nv.setRadiologicalConvention(ctRadiological);
       ctBuiltFor = index;
+      ctPristine = null;
+      ctSlabNote = "";
+      ctBone = false;
+      // The engine picked its own window off the histogram; that is what the sliders must read
+      // until either the stored one or a preset button says otherwise.
+      var own = XV.ctWindowFromRange(image.cal_min, image.cal_max);
+      ctWidth = own.width;
+      ctLevel = own.level;
+      ctPresetKey = "";
+      ctSyncWindowControls();
+      ctSetMode(ctMode);
       ctShowEngine(true);
       ctMessage("");
       ctResize();
       updateCtStatus();
       ctBusy = false;
+      ctRestoreWindow(seriesList[index], stale);
       return image;
     }).catch(function (e) {
       ctBusy = false;
@@ -1946,6 +2071,341 @@
     });
   }
 
+  // ------------------------------------------------ windows, modes, slab, probe
+  /* Everything below drives the one Niivue instance the build above made. Two facts it all
+   * rests on, both read out of niivue@0.69.0's index.d.ts and its bundle rather than assumed:
+   *
+   *  - cal_min / cal_max on volumes[0] are the window, in the same units getValue returns
+   *    (Hounsfield for a CT), and updateGLVolume() is what re-uploads after a change
+   *    (index.d.ts:829 "Call updateGLVolume() on the Niivue instance after this", :4431).
+   *  - getVolumeData / setVolumeData (index.d.ts:931, :941) read and write the voxels "in RAS
+   *    coordinates", walking the raw array through img2RASstep. That is the same space
+   *    frac2vox reports the crosshair in, so x is left-right, y back-front, z foot-head no
+   *    matter which way round the scanner stored the file.
+   */
+
+  function ctVolume() {
+    return nv && nv.volumes.length && ctBuiltFor === ctIndex ? nv.volumes[0] : null;
+  }
+
+  /** [nx, ny, nz] in the RAS order frac2vox and the slab both work in. */
+  function ctDimsRAS(volume) {
+    var d = volume.dimsRAS && volume.dimsRAS.length >= 4 ? volume.dimsRAS : volume.hdr.dims;
+    return [Math.max(1, d[1] | 0), Math.max(1, d[2] | 0), Math.max(1, d[3] | 0)];
+  }
+
+  function ctPixDimsRAS(volume) {
+    var p = volume.pixDimsRAS && volume.pixDimsRAS.length >= 4 ? volume.pixDimsRAS : volume.hdr.pixDims;
+    return [Math.abs(p[1]) || 1, Math.abs(p[2]) || 1, Math.abs(p[3]) || 1];
+  }
+
+  /** The plane a single-pane mode is showing; "" for the 2×2 and the 3-D render. */
+  function ctPlaneOf(mode) {
+    return mode === "axial" || mode === "coronal" || mode === "sagittal" ? mode : "";
+  }
+
+  function ctActiveAxis() {
+    return XV.CT_PLANE_AXIS[ctPlaneOf(ctMode) || "axial"];
+  }
+
+  /* The voxels as the scanner measured them. While a slab is on, what Niivue holds is the
+   * projection, so every HU reading has to come off the copy kept beside it — "91 HU" must
+   * keep meaning what the scanner measured, not what the slab made of eleven slices. */
+  function ctReadVoxels(volume) {
+    if (ctPristine) return ctPristine;
+    var dims = ctDimsRAS(volume);
+    return volume.getVolumeData([0, 0, 0], [dims[0] - 1, dims[1] - 1, dims[2] - 1], "same")[0];
+  }
+
+  function ctScaleHu(volume, raw) {
+    var slope = Number(volume.hdr.scl_slope);
+    if (!isFinite(slope) || slope === 0) slope = 1;
+    var inter = Number(volume.hdr.scl_inter);
+    if (!isFinite(inter)) inter = 0;
+    return raw * slope + inter;
+  }
+
+  // ------------------------------------------------------------- the window
+
+  /* The one place ctWidth and ctLevel are pinned to what the sliders can express: a stored
+   * record, a slider and the engine's own read-back all arrive here, and a window that is not
+   * a number would otherwise reach cal_min as NaN and black the whole pane out. */
+  function ctSyncWindowControls() {
+    var limits = XV.CT_WINDOW_LIMITS;
+    var w = Math.round(Number(ctWidth));
+    var l = Math.round(Number(ctLevel));
+    ctWidth = isFinite(w) ? Math.min(limits.widthMax, Math.max(limits.widthMin, w)) : limits.widthMin;
+    ctLevel = isFinite(l) ? Math.min(limits.levelMax, Math.max(limits.levelMin, l)) : 0;
+    el("ctWidth").value = String(ctWidth);
+    el("ctLevel").value = String(ctLevel);
+    el("ctWidthValue").textContent = String(ctWidth);
+    el("ctLevelValue").textContent = String(ctLevel);
+    XV.CT_PRESETS.forEach(function (preset) {
+      el("ctPreset-" + preset.key).setAttribute("aria-pressed", String(preset.key === ctPresetKey));
+    });
+  }
+
+  function ctApplyWindow() {
+    var volume = ctVolume();
+    if (!volume) return;
+    // The Bone view owns the window while it is on; turning it off puts this one back.
+    if (ctBone && ctMode === "render") return;
+    var range = XV.ctWindowRange(ctWidth, ctLevel);
+    volume.cal_min = range.min;
+    volume.cal_max = range.max;
+    nv.updateGLVolume();
+  }
+
+  function ctSetWindow(width, level, presetKey, remember) {
+    ctWidth = width;
+    ctLevel = level;
+    ctPresetKey = presetKey || "";
+    ctSyncWindowControls();
+    ctApplyWindow();
+    if (remember !== false) ctRememberWindow();
+    updateCtStatus();
+  }
+
+  function ctRememberWindow() {
+    var series = seriesList[ctIndex];
+    if (!series || !series.uid) return;
+    var record = { uid: series.uid, preset: ctPresetKey, width: ctWidth, level: ctLevel };
+    clearTimeout(ctWindowSaveTimer);
+    ctWindowSaveTimer = setTimeout(function () {
+      saveCtMeta(record).catch(function () { /* full or private: it just will not come back */ });
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  function ctRestoreWindow(series, stale) {
+    if (!series || !series.uid) return;
+    loadCtMeta(series.uid).then(function (rec) {
+      if (!rec || stale() || !ctVolume()) return;
+      ctSetWindow(rec.width, rec.level, rec.preset, false);
+    });
+  }
+
+  // -------------------------------------------------------------- the modes
+
+  function ctSetMode(mode) {
+    ctMode = CT_MODES.indexOf(mode) === -1 ? "slices" : mode;
+    CT_MODES.forEach(function (name) {
+      el(CT_MODE_BUTTON[name]).setAttribute("aria-pressed", String(name === ctMode));
+    });
+    ctStopCine();          // there is no one pane to play in the 2×2 or the render
+    if (nv && nv.volumes.length) {
+      if (ctMode === "slices") {
+        nv.opts.multiplanarShowRender = ctEngine.SHOW_RENDER.ALWAYS;
+        nv.setMultiplanarLayout(ctEngine.MULTIPLANAR_TYPE.GRID);
+        nv.setSliceType(ctEngine.SLICE_TYPE.MULTIPLANAR);
+      } else if (ctMode === "render") {
+        nv.setSliceType(ctEngine.SLICE_TYPE.RENDER);
+      } else {
+        nv.setSliceType(ctEngine.SLICE_TYPE[ctMode.toUpperCase()]);
+      }
+    }
+    ctSyncModeControls();
+    ctApplyBone();
+    ctApplySlab();
+    updateCtStatus();
+  }
+
+  function ctSyncModeControls() {
+    var plane = ctPlaneOf(ctMode);
+    el("ctSlab").disabled = !plane;
+    el("ctSlabMode").disabled = !plane || !ctSlabMm;
+    el("ctCine").disabled = !plane;
+    el("ctBone").disabled = ctMode !== "render";
+    el("ctBone").setAttribute("aria-pressed", String(ctBone && ctMode === "render"));
+  }
+
+  /* Niivue ships a CT bone transfer function of its own — the colormap "ct_bones", whose alpha
+   * ramp starts at zero — so the 3-D bone view is that colormap with the window moved up to
+   * 300 HU, and everything softer than bone goes transparent. No mesh, no marching cubes.
+   * ponytail: ct_bones carries its own min/max (180/600) and NVImage.calMinMax would use them,
+   * but refreshLayers only calls calMinMax while global_min is undefined — once, at load — so
+   * the pair set here is the one that renders. */
+  function ctApplyBone() {
+    var volume = ctVolume();
+    if (!volume) return;
+    var on = ctBone && ctMode === "render";
+    var range = on ? XV.ctWindowRange(CT_BONE_3D.width, CT_BONE_3D.level)
+                   : XV.ctWindowRange(ctWidth, ctLevel);
+    // The colormap setter re-runs calMinMax, which is a histogram over every voxel and which
+    // would take ct_bones' own 180/600 — so it is set first, only when it has to change, and
+    // the pair below is what survives.
+    var want = on ? "ct_bones" : "gray";
+    if (volume.colormap !== want) volume.colormap = want;
+    volume.cal_min = range.min;
+    volume.cal_max = range.max;
+    nv.updateGLVolume();
+  }
+
+  // --------------------------------------------------------------- the slab
+
+  function ctSlabModeName(key) {
+    for (var i = 0; i < XV.CT_SLAB_MODES.length; i++) {
+      if (XV.CT_SLAB_MODES[i].key === key) return XV.CT_SLAB_MODES[i].name;
+    }
+    return key;
+  }
+
+  function ctEnsureSlabWorker() {
+    if (ctSlabWorker !== undefined) return ctSlabWorker;
+    try {
+      ctSlabWorker = new Worker("ct-worker.js");
+      ctSlabWorker.onmessage = function (ev) {
+        var d = ev.data || {};
+        var job = ctSlabJobs[d.id];
+        delete ctSlabJobs[d.id];
+        if (!job) return;
+        if (d.error) { ctSlabNote = "slab failed: " + d.error; updateCtStatus(); return; }
+        job(d.img);
+      };
+      ctSlabWorker.onerror = function () { ctSlabWorker = null; ctSlabJobs = {}; };
+    } catch (e) {
+      ctSlabWorker = null;
+    }
+    return ctSlabWorker;
+  }
+
+  /* A thick slice: every voxel of the pane becomes the brightest, darkest or average voxel of
+   * the millimetres either side of it. Niivue 0.69 has no such thing — "MIP" does not occur
+   * once in niivue.umd.js — so the arithmetic is XV.slabProject, run in ct-worker.js, and the
+   * result is written back through setVolumeData (Niivue's own RAS-space writer) before
+   * updateGLVolume() re-uploads the texture. */
+  function ctApplySlab() {
+    var volume = ctVolume();
+    if (!volume) return;
+    var plane = ctPlaneOf(ctMode);
+    var token = ++ctSlabToken;
+    var dims = ctDimsRAS(volume);
+    var end = [dims[0] - 1, dims[1] - 1, dims[2] - 1];
+    if (!plane || !ctSlabMm) {
+      ctSlabNote = "";
+      if (ctPristine) {
+        volume.setVolumeData([0, 0, 0], end, ctPristine);
+        ctPristine = null;
+        nv.updateGLVolume();
+      }
+      updateCtStatus();
+      return;
+    }
+    var axis = XV.CT_PLANE_AXIS[plane];
+    var mmPerVoxel = ctPixDimsRAS(volume)[axis];
+    var half = Math.max(1, Math.round((ctSlabMm / 2) / mmPerVoxel));
+    if (!ctPristine) ctPristine = ctReadVoxels(volume);
+    var source = ctPristine;
+    var label = ctSlabMm + " mm " + ctSlabModeName(ctSlabMode) +
+      " over " + (half * 2 + 1) + " slices";
+    var land = function (projected) {
+      if (token !== ctSlabToken || !ctVolume()) return;
+      ctVolume().setVolumeData([0, 0, 0], end, projected);
+      nv.updateGLVolume();
+      ctSlabNote = label;
+      updateCtStatus();
+    };
+    var worker = ctEnsureSlabWorker();
+    if (!worker) {
+      land(XV.slabProject(source, dims, axis, half, ctSlabMode));
+      return;
+    }
+    ctSlabNote = label + " · working…";
+    updateCtStatus();
+    var copy = source.slice();
+    ctSlabJobs[token] = function (buffer) {
+      land(new source.constructor(buffer));
+    };
+    worker.postMessage({
+      id: token, img: copy.buffer, type: copy.constructor.name,
+      dims: dims, axis: axis, half: half, mode: ctSlabMode,
+    }, [copy.buffer]);
+  }
+
+  // --------------------------------------------------------- slices and cine
+
+  /** One slice along whichever axis the pane on screen scrolls, wrapping at both ends. */
+  function ctStepSlice(by) {
+    var volume = ctVolume();
+    if (!volume) return;
+    var axis = ctActiveAxis();
+    var count = ctDimsRAS(volume)[axis];
+    var vox;
+    try { vox = nv.frac2vox(nv.scene.crosshairPos); } catch (e) { return; }
+    var target = [Math.round(vox[0]), Math.round(vox[1]), Math.round(vox[2])];
+    // Cine has to come round again at the end rather than sit on the last slice.
+    target[axis] = ((Math.round(vox[axis]) + by) % count + count) % count;
+    nv.scene.crosshairPos = nv.vox2frac(target);
+    nv.drawScene();
+    updateCtStatus();
+  }
+
+  function ctStopCine() {
+    clearInterval(ctCineTimer);
+    ctCineTimer = null;
+    el("ctCine").setAttribute("aria-pressed", "false");
+  }
+
+  function ctStartCine() {
+    ctStopCine();
+    if (!ctPlaneOf(ctMode) || !ctVolume()) return;
+    ctCineTimer = setInterval(function () { ctStepSlice(1); }, Math.round(1000 / CT_CINE_FPS));
+    el("ctCine").setAttribute("aria-pressed", "true");
+  }
+
+  // ----------------------------------------------------------- the HU probe
+
+  function ctHideProbe() { el("ctProbe").classList.remove("show"); }
+
+  function ctCancelHold() {
+    if (!ctHold) return;
+    clearTimeout(ctHold.timer);
+    ctHold = null;
+  }
+
+  /* Hold a finger still on the image and it says what is under it: the crosshair's own HU, and
+   * the mean and spread over a 5 mm disc — one number is noise, a disc is a reading.
+   * ponytail: in the 2×2 and the 3-D render the disc is taken in the axial plane, because
+   * which of the four tiles a finger is in is Niivue's business, not something it publishes. */
+  function ctProbeAt(clientX, clientY) {
+    var volume = ctVolume();
+    if (!volume) return;
+    var vox;
+    try { vox = nv.frac2vox(nv.scene.crosshairPos); } catch (e) { return; }
+    var plane = ctPlaneOf(ctMode) || "axial";
+    var stats = XV.huDisc(
+      ctReadVoxels(volume), ctDimsRAS(volume), ctPixDimsRAS(volume),
+      [Math.round(vox[0]), Math.round(vox[1]), Math.round(vox[2])],
+      XV.CT_PLANE_AXIS[plane], CT_PROBE_RADIUS_MM
+    );
+    var lo = ctScaleHu(volume, stats.min), hi = ctScaleHu(volume, stats.max);
+    if (lo > hi) { var swap = lo; lo = hi; hi = swap; }   // a negative scl_slope flips the ends
+
+    var box = el("ctProbe");
+    box.textContent = "";
+    var head = document.createElement("b");
+    head.textContent = Math.round(ctScaleHu(volume, stats.value)) + " HU";
+    var disc = document.createElement("div");
+    disc.textContent = CT_PROBE_RADIUS_MM + " mm disc: mean " +
+      Math.round(ctScaleHu(volume, stats.mean)) + ", " +
+      Math.round(lo) + " to " + Math.round(hi) + " HU";
+    var where = document.createElement("div");
+    where.textContent = plane + ", " + stats.count + " voxels";
+    box.appendChild(head);
+    box.appendChild(disc);
+    box.appendChild(where);
+    box.classList.add("show");
+
+    // Above and right of the finger, folded back inside the stage when there is no room.
+    var stage = el("ctStage").getBoundingClientRect();
+    var x = clientX - stage.left + 18;
+    var y = clientY - stage.top - box.offsetHeight - 18;
+    if (x + box.offsetWidth > stage.width - 8) x = stage.width - box.offsetWidth - 8;
+    if (x < 8) x = 8;
+    if (y < 8) y = clientY - stage.top + 26;
+    box.style.left = Math.round(x) + "px";
+    box.style.top = Math.round(y) + "px";
+  }
+
   function updateCtStatus() {
     var series = seriesList[ctIndex];
     if (!series) { el("ctStatus").textContent = ""; return; }
@@ -1954,18 +2414,29 @@
       // Read the crosshair off the scene rather than waiting for onLocationChange, so the
       // line is complete the moment the volume lands, not only after the first touch.
       var volume = nv.volumes[0];
-      var dims = volume.hdr ? volume.hdr.dims : null;
+      var dims = volume.hdr ? ctDimsRAS(volume) : null;
       var vox = null;
       try { vox = nv.frac2vox(nv.scene.crosshairPos); } catch (e) { vox = null; }
+      if (dims) parts.push(dims[0] + "×" + dims[1] + "×" + dims[2] + " voxels");
       if (vox && dims) {
-        parts.push(dims[1] + "×" + dims[2] + "×" + dims[3] + " voxels");
-        parts.push("slice " + (Math.round(vox[2]) + 1) + " of " + dims[3]);
-        var hu = volume.getValue(Math.round(vox[0]), Math.round(vox[1]), Math.round(vox[2]));
+        var axis = ctActiveAxis();
+        parts.push("slice " + (Math.round(vox[axis]) + 1) + " of " + dims[axis]);
+        // Off the real voxels, not off what a slab left on screen.
+        var voxels = ctPristine;
+        var hu = voxels
+          ? ctScaleHu(volume, voxels[Math.round(vox[0]) + Math.round(vox[1]) * dims[0] +
+              Math.round(vox[2]) * dims[0] * dims[1]])
+          : volume.getValue(Math.round(vox[0]), Math.round(vox[1]), Math.round(vox[2]));
         if (isFinite(hu)) parts.push(Math.round(hu) + " HU at the crosshair");
-      } else if (dims) {
-        parts.push(dims[1] + "×" + dims[2] + "×" + dims[3] + " voxels");
       }
+      parts.push(CT_MODE_NAME[ctMode]);
+      parts.push("window " + Math.round(ctWidth) + "/" + Math.round(ctLevel) +
+        (ctPresetKey ? " (" + XV.ctPreset(ctPresetKey).name.toLowerCase() + ")" : ""));
+      if (ctSlabNote) parts.push(ctSlabNote);
+      if (ctBone && ctMode === "render") parts.push("bone only");
+      if (ctCineTimer) parts.push("cine " + CT_CINE_FPS + " a second");
       parts.push(ctRadiological ? "radiological" : "neurological");
+      if (ctAutoNote) parts.push(ctAutoNote);
       if (ctVolumeNote) parts.push(ctVolumeNote);
     } else {
       var slice = series.instances[series.middle];
@@ -2007,6 +2478,16 @@
     ctIndex = index;
     ctWhere = null;
     ctVolumeNote = "";
+    // Everything the last series was being read at belongs to that series, not to this one.
+    ctStopCine();
+    ctHideProbe();
+    ctPristine = null;
+    ctSlabNote = "";
+    ctAutoNote = "";
+    ctBone = false;
+    ctSlabMm = 0;
+    el("ctSlab").value = "0";
+    ctSyncModeControls();
     if (index >= 0) el("ctSeries").value = String(index);
     renderCtSlice();
     if (activeTab === "ct") ctActivate(); else drawCt();
@@ -2085,21 +2566,143 @@
   }
 
   el("ctSeries").onchange = function () { ctSelect(Number(el("ctSeries").value)); };
-  el("ctRadiological").onclick = function () {
-    ctRadiological = !ctRadiological;
+
+  function ctSetRadiological(on) {
+    ctRadiological = !!on;
     el("ctRadiological").setAttribute("aria-pressed", String(ctRadiological));
     el("ctRadiological").textContent = ctRadiological ? "Radiological" : "Neurological";
     if (nv) nv.setRadiologicalConvention(ctRadiological);
     updateCtStatus();
-  };
+  }
+  el("ctRadiological").onclick = function () { ctSetRadiological(!ctRadiological); };
+
   // Buttons as well as gestures: iPadOS Safari's gesture strip has eaten taps at the bottom of
   // this app before, and a slice step has to be reachable without a mouse wheel.
-  function stepSlice(by) {
-    if (!nv || ctBuiltFor !== ctIndex) return;
-    nv.moveCrosshairInVox(0, 0, by);
+  el("ctPrevSlice").onclick = function () { ctStepSlice(-1); };
+  el("ctNextSlice").onclick = function () { ctStepSlice(1); };
+
+  // --- the window row: Auto, then one button per preset, then the two sliders
+  (function buildCtPresets() {
+    var row = el("ctPresets");
+    var auto = document.createElement("button");
+    auto.id = "ctAuto";
+    auto.title = "Pick the window from what the series says was scanned, and hang it like a film.";
+    auto.appendChild(document.createTextNode("Auto"));
+    var autoHint = document.createElement("small");
+    autoHint.textContent = "from the series";
+    auto.appendChild(autoHint);
+    row.appendChild(auto);
+    XV.CT_PRESETS.forEach(function (preset) {
+      var button = document.createElement("button");
+      button.id = "ctPreset-" + preset.key;
+      button.setAttribute("aria-pressed", "false");
+      button.title = preset.name + " — window " + preset.width + ", level " + preset.level;
+      button.appendChild(document.createTextNode(preset.name));
+      var hint = document.createElement("small");
+      hint.textContent = preset.hint;
+      button.appendChild(hint);
+      button.onclick = function () {
+        ctAutoNote = "";
+        ctSetWindow(preset.width, preset.level, preset.key);
+      };
+      row.appendChild(button);
+    });
+  })();
+
+  el("ctAuto").onclick = function () {
+    var series = seriesList[ctIndex];
+    if (!series) return;
+    var pick = XV.ctAutoPreset(series);
+    var preset = XV.ctPreset(pick.key);
+    ctSetRadiological(true);
+    ctSetWindow(preset.width, preset.level, preset.key);
+    ctAutoNote = "auto picked " + preset.name.toLowerCase() +
+      (pick.matched ? ' from "' + pick.matched + '"' : " — nothing in the series names a body part");
+    updateCtStatus();
+  };
+
+  function ctSliderMoved() {
+    ctSetWindow(Number(el("ctWidth").value), Number(el("ctLevel").value), "");
   }
-  el("ctPrevSlice").onclick = function () { stepSlice(-1); };
-  el("ctNextSlice").onclick = function () { stepSlice(1); };
+  el("ctWidth").oninput = ctSliderMoved;
+  el("ctLevel").oninput = ctSliderMoved;
+
+  // --- the mode row
+  CT_MODES.forEach(function (name) {
+    el(CT_MODE_BUTTON[name]).onclick = function () { ctSetMode(name); };
+  });
+
+  el("ctBone").onclick = function () {
+    ctBone = !ctBone;
+    el("ctBone").setAttribute("aria-pressed", String(ctBone));
+    ctApplyBone();
+    updateCtStatus();
+  };
+
+  el("ctCine").onclick = function () {
+    if (ctCineTimer) ctStopCine(); else ctStartCine();
+    updateCtStatus();
+  };
+
+  el("ctHome").onclick = function () {
+    if (!nv) return;
+    if (ctHomeView) {
+      nv.setRenderAzimuthElevation(ctHomeView.azimuth, ctHomeView.elevation);
+      nv.scene.volScaleMultiplier = ctHomeView.zoom;
+      nv.scene.pan2Dxyzmm = ctHomeView.pan.slice();
+    }
+    nv.scene.crosshairPos = [0.5, 0.5, 0.5];
+    nv.drawScene();
+    updateCtStatus();
+  };
+
+  (function buildCtSlab() {
+    var thickness = el("ctSlab");
+    XV.CT_SLAB_MM.forEach(function (mm) {
+      var option = document.createElement("option");
+      option.value = String(mm);
+      option.textContent = mm ? mm + " mm" : "off";
+      thickness.appendChild(option);
+    });
+    var mode = el("ctSlabMode");
+    XV.CT_SLAB_MODES.forEach(function (entry) {
+      var option = document.createElement("option");
+      option.value = entry.key;
+      option.textContent = entry.name;
+      mode.appendChild(option);
+    });
+    thickness.onchange = function () {
+      ctSlabMm = Number(thickness.value);
+      ctSyncModeControls();
+      ctApplySlab();
+    };
+    mode.onchange = function () {
+      ctSlabMode = mode.value;
+      ctApplySlab();
+    };
+  })();
+
+  // --- tap and hold for the HU readout
+  ctGl.addEventListener("pointerdown", function (ev) {
+    ctCancelHold();
+    ctHideProbe();
+    var hold = { x: ev.clientX, y: ev.clientY, id: ev.pointerId, timer: null };
+    // Niivue's own single-touch handler drags the crosshair to the finger, so by the time this
+    // fires the crosshair is already where the readout is about to be drawn.
+    hold.timer = setTimeout(function () { ctProbeAt(hold.x, hold.y); }, CT_PROBE_HOLD_MS);
+    ctHold = hold;
+  }, { passive: true });
+  ctGl.addEventListener("pointermove", function (ev) {
+    if (!ctHold || ev.pointerId !== ctHold.id) return;
+    if (Math.abs(ev.clientX - ctHold.x) > TAP_SLOP_PX ||
+        Math.abs(ev.clientY - ctHold.y) > TAP_SLOP_PX) ctCancelHold();
+  }, { passive: true });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(function (type) {
+    ctGl.addEventListener(type, function () { ctCancelHold(); ctHideProbe(); }, { passive: true });
+  });
+
+  ctSyncWindowControls();
+  ctSyncModeControls();
 
   // ------------------------------------------------------------- tabs
   // The relief tab lives in a module script (it needs a dynamic import for three.js);
@@ -2114,6 +2717,7 @@
     el("tab2d").setAttribute("aria-pressed", String(name === "2d"));
     el("tabRelief").setAttribute("aria-pressed", String(name === "relief"));
     el("tabCT").setAttribute("aria-pressed", String(name === "ct"));
+    if (name !== "ct") { ctStopCine(); ctHideProbe(); }
     if (name === "2d") { resize(); requestDraw(); }
     else if (name === "ct") ctActivate();
     else if (window.ReliefTab) window.ReliefTab.activate();
