@@ -1,6 +1,6 @@
 /* Service worker: cache-first app shell, so the viewer opens with no network at all.
  * Bump CACHE whenever any shell file changes — the version string is what evicts the old copy. */
-var CACHE = "xray-ipad-v7";
+var CACHE = "xray-ipad-v8";
 
 var SHELL = [
   "./",

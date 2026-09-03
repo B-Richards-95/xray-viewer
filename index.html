@@ -91,6 +91,9 @@
   #controls {
     display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px;
     padding: 10px 12px; border-top: 1px solid var(--line); background: var(--panel);
+    /* iPadOS Safari owns the bottom strip for its own gestures (2026-09-03: Build never heard a
+     * tap there), so the bar keeps its buttons clear of the screen edge. */
+    padding-bottom: max(28px, calc(env(safe-area-inset-bottom) + 12px));
   }
   .slider { display: flex; align-items: center; gap: 8px; flex: 1 1 200px; min-width: 180px; }
   .slider label { color: var(--ink-dim); font-size: 13px; white-space: nowrap; }
@@ -1977,15 +1980,8 @@ function tapBuild(ev) {
 el("reliefBuild").addEventListener("pointerup", tapBuild);
 el("reliefBuild").addEventListener("click", tapBuild);
 
-// Tap tracer + fallback (iPad, 2026-09-03): the Build button never heard a touch on Blake's
-// iPad while the emulator built fine. Every touch on the page names its target on the panel,
-// and a tap on the empty relief stage builds too — a target no toolbar overlap can hide.
-document.addEventListener("pointerdown", (ev) => {
-  if (mesh || el("panelRelief") && el("panelRelief").classList.contains("hide")) return;
-  const t = ev.target;
-  const name = t && t.tagName ? t.tagName.toLowerCase() + (t.id ? "#" + t.id : "") : String(t);
-  setMessage("Touch on " + name + " (" + ev.pointerType + ")" + (t === canvas ? " — building…" : " — tap Build, or tap the black area to build."));
-}, true);
+// Fallback (iPad, 2026-09-03): a tap on the empty relief stage builds too — the bottom bar sat in
+// iPadOS Safari's gesture strip and never heard the tap; the bar is now padded clear of it.
 canvas.addEventListener("pointerup", (ev) => {
   if (!mesh && window.XVApp && window.XVApp.film() && pointers.size <= 1) tapBuild(ev);
 });
