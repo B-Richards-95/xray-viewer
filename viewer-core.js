@@ -226,6 +226,151 @@
     return angleDeg(a, vertex, b, spacingMm).toFixed(1) + "°";
   }
 
+  // ------------------------------------------------------------------ marks
+  // A mark is {id, type, pts:[[x, y]...], meta} with every point in image pixels, and no
+  // value stored on it: describeMark recomputes the label at draw time, so recalibrating
+  // the film relabels marks that were placed before it.
+
+  var POINTS_NEEDED = { line: 2, angle: 3, cobb: 4, circle: 2, ellipse: 2, point: 1, text: 1 };
+  // Where a mark's label sits relative to its last handle, in screen px. Drawing and
+  // hit-testing share it so a tap lands on what the eye sees.
+  var LABEL_OFFSET = [16, -28];
+
+  function toMm(p, spacingMm) {
+    return [p[0] * spacingMm[1], p[1] * spacingMm[0]];
+  }
+
+  /** Direction of a->b measured from screen-right, degrees, in millimetre space. */
+  function lineTiltDeg(a, b, spacingMm) {
+    spacingMm = spacingMm || [1.0, 1.0];
+    var ma = toMm(a, spacingMm), mb = toMm(b, spacingMm);
+    return (Math.atan2(mb[1] - ma[1], mb[0] - ma[0]) * 180.0) / Math.PI;
+  }
+
+  /** Signed difference between two tilts folded into (-90, 90]: which way line 2 leans. */
+  function tiltDifference(t1, t2) {
+    var d = (((t2 - t1 + 90) % 180) + 180) % 180;
+    return d - 90 === -90 ? 90 : d - 90;
+  }
+
+  /** Cobb angle: the acute angle between two lines given as [a1, a2, b1, b2]. */
+  function cobbAngle(pts, spacingMm) {
+    if (!pts || pts.length < 4) return 0.0;
+    return Math.abs(tiltDifference(lineTiltDeg(pts[0], pts[1], spacingMm), lineTiltDeg(pts[2], pts[3], spacingMm)));
+  }
+
+  /** Circle from centre + a point on the rim. Millimetres unless calibrated === false. */
+  function circleMetrics(pts, spacingMm, calibrated) {
+    var r = calibrated === false ? distancePx(pts[0], pts[1]) : distanceMm(pts[0], pts[1], spacingMm);
+    return { radius: r, diameter: 2 * r };
+  }
+
+  /** Ellipse from two opposite corners of its bounding box: both axes, longer first. */
+  function ellipseMetrics(pts, spacingMm, calibrated) {
+    var sp = calibrated === false ? [1.0, 1.0] : spacingMm || [1.0, 1.0];
+    var w = Math.abs(pts[1][0] - pts[0][0]) * sp[1];
+    var h = Math.abs(pts[1][1] - pts[0][1]) * sp[0];
+    return { major: Math.max(w, h), minor: Math.min(w, h), width: w, height: h };
+  }
+
+  /** The label a mark carries, recomputed from its points. "" while it is incomplete. */
+  function describeMark(mark, spacingMm, calibrated) {
+    var pts = (mark && mark.pts) || [];
+    var meta = (mark && mark.meta) || {};
+    var sp = calibrated === false ? [1.0, 1.0] : spacingMm || [1.0, 1.0];
+    var suffix = calibrated === false ? PIXEL_SUFFIX : DISTANCE_SUFFIX;
+    if (mark.type === "text") return meta.text || "";
+    if (mark.type === "point") return meta.n === undefined ? "" : String(meta.n);
+    if (pts.length < (POINTS_NEEDED[mark.type] || 0)) return "";
+    if (mark.type === "line") return formatDistance(pts[0], pts[1], sp, calibrated);
+    if (mark.type === "angle") return formatAngle(pts[0], pts[1], pts[2], sp);
+    if (mark.type === "cobb") return cobbAngle(pts, sp).toFixed(1) + "° Cobb";
+    if (mark.type === "circle") {
+      var c = circleMetrics(pts, sp, calibrated);
+      return "⌀ " + c.diameter.toFixed(1) + " · r " + c.radius.toFixed(1) + " " + suffix;
+    }
+    if (mark.type === "ellipse") {
+      var e = ellipseMetrics(pts, sp, calibrated);
+      return "axes " + e.major.toFixed(1) + " × " + e.minor.toFixed(1) + " " + suffix;
+    }
+    return "";
+  }
+
+  /* Nearest grabbable thing to a screen point: a handle, or the mark's label.
+   * Topmost mark wins a tie (the list is walked backwards), and nothing outside
+   * `radius` screen px is ever returned — pan and pinch must not grab a handle.
+   */
+  function hitTest(marks, screenPt, toScreen, radius) {
+    var best = null, bestD = radius;
+    for (var i = (marks || []).length - 1; i >= 0; i--) {
+      var pts = marks[i].pts || [];
+      for (var j = 0; j < pts.length; j++) {
+        var s = toScreen(pts[j]);
+        var d = Math.hypot(screenPt[0] - s[0], screenPt[1] - s[1]);
+        if (d < bestD) { bestD = d; best = { markIndex: i, ptIndex: j }; }
+      }
+      if (pts.length) {
+        var l = toScreen(pts[pts.length - 1]);
+        var dl = Math.hypot(screenPt[0] - l[0] - LABEL_OFFSET[0], screenPt[1] - l[1] - LABEL_OFFSET[1]);
+        if (dl < bestD) { bestD = dl; best = { markIndex: i, ptIndex: "label" }; }
+      }
+    }
+    return best;
+  }
+
+  function snapAngle(deg, step) {
+    return step > 0 ? Math.round(deg / step) * step : deg;
+  }
+
+  /** Rotate a point about a pivot by `deg`, in millimetre space, back into image px. */
+  function rotateAboutMm(pivot, p, deg, spacingMm) {
+    var sp = spacingMm || [1.0, 1.0];
+    var mp = toMm(pivot, sp), m = toMm(p, sp);
+    var a = (deg * Math.PI) / 180.0, cos = Math.cos(a), sin = Math.sin(a);
+    var dx = m[0] - mp[0], dy = m[1] - mp[1];
+    return [(mp[0] + cos * dx - sin * dy) / sp[1], (mp[1] + sin * dx + cos * dy) / sp[0]];
+  }
+
+  /* Set an angle/cobb mark to an exact value by turning its last arm, keeping the arm's
+   * length and the side it currently leans (Datum's typed-angle pattern).
+   */
+  function setMarkAngle(mark, deg, spacingMm) {
+    var pts = mark.pts.map(function (p) { return p.slice(); });
+    if (mark.type === "angle" && pts.length >= 3) {
+      var current = angleDeg(pts[0], pts[1], pts[2], spacingMm);
+      var v = toMm(pts[1], spacingMm || [1.0, 1.0]);
+      var a = toMm(pts[0], spacingMm || [1.0, 1.0]);
+      var b = toMm(pts[2], spacingMm || [1.0, 1.0]);
+      var cross = (a[0] - v[0]) * (b[1] - v[1]) - (a[1] - v[1]) * (b[0] - v[0]);
+      pts[2] = rotateAboutMm(pts[1], pts[2], (cross < 0 ? -1 : 1) * (deg - current), spacingMm);
+      return pts;
+    }
+    if (mark.type === "cobb" && pts.length >= 4) {
+      var t1 = lineTiltDeg(pts[0], pts[1], spacingMm);
+      var t2 = lineTiltDeg(pts[2], pts[3], spacingMm);
+      var lean = tiltDifference(t1, t2);
+      pts[3] = rotateAboutMm(pts[2], pts[3], (lean < 0 ? -1 : 1) * deg - lean, spacingMm);
+      return pts;
+    }
+    return pts;
+  }
+
+  /* Set a line/circle mark to an exact length by sliding its last point along the ray it
+   * already lies on. `value` is the line's length, or the circle's diameter.
+   */
+  function setMarkLength(mark, value, spacingMm, calibrated) {
+    var pts = mark.pts.map(function (p) { return p.slice(); });
+    if (pts.length < 2) return pts;
+    var target = mark.type === "circle" ? value / 2 : value;
+    var current = calibrated === false
+      ? distancePx(pts[0], pts[1])
+      : distanceMm(pts[0], pts[1], spacingMm);
+    if (!(current > 0) || !(target > 0)) return pts;
+    var k = target / current;
+    pts[1] = [pts[0][0] + (pts[1][0] - pts[0][0]) * k, pts[0][1] + (pts[1][1] - pts[0][1]) * k];
+    return pts;
+  }
+
   // ------------------------------------------------------------ relief maths
 
   /** Port of view3d_relief.downsample: plain strided decimation, no averaging. */
@@ -815,6 +960,17 @@
     angleDeg: angleDeg,
     formatDistance: formatDistance,
     formatAngle: formatAngle,
+    lineTiltDeg: lineTiltDeg,
+    cobbAngle: cobbAngle,
+    circleMetrics: circleMetrics,
+    ellipseMetrics: ellipseMetrics,
+    describeMark: describeMark,
+    hitTest: hitTest,
+    snapAngle: snapAngle,
+    setMarkAngle: setMarkAngle,
+    setMarkLength: setMarkLength,
+    POINTS_NEEDED: POINTS_NEEDED,
+    LABEL_OFFSET: LABEL_OFFSET,
     downsample: downsample,
     normalize: normalize,
     gaussianBlur: gaussianBlur,

@@ -81,6 +81,96 @@ check("angle_deg = 135.0", near(a135, 135.0, 1e-9), `${a135}`);
 check("format_angle = 135.0°", XV.formatAngle([100, 100], [200, 200], [400, 200], [0.125, 0.125]) === "135.0°");
 check("angle_deg degenerate arm = 0", XV.angleDeg([5, 5], [5, 5], [9, 9], [1, 1]) === 0.0);
 
+// --------------------------------------------------------------- marks 2.6
+// Every value below is worked out by hand at spacing 0.125 mm/px isotropic, so a
+// distance of n px is n/8 mm.
+const sp = [0.125, 0.125];
+const mark = (type, pts, meta) => ({ id: "t", type, pts, meta: meta || {} });
+
+check(
+  "describeMark line = 62.5 mm",
+  XV.describeMark(mark("line", [[100, 200], [400, 600]]), sp, true) === `62.5 ${XV.DISTANCE_SUFFIX}`,
+  XV.describeMark(mark("line", [[100, 200], [400, 600]]), sp, true)
+);
+check(
+  "describeMark line uncalibrated = 500.0 px",
+  XV.describeMark(mark("line", [[100, 200], [400, 600]]), sp, false) === `500.0 ${XV.PIXEL_SUFFIX}`
+);
+check(
+  "describeMark angle (end→vertex→end) = 90.0°",
+  XV.describeMark(mark("angle", [[100, 100], [100, 300], [400, 300]]), sp, true) === "90.0°"
+);
+// cobb: line 1 is horizontal (0°), line 2 rises 100 px over 100 px (45°) -> 45.0
+check(
+  "describeMark cobb = 45.0°",
+  XV.describeMark(mark("cobb", [[0, 0], [100, 0], [0, 0], [100, 100]]), sp, true) === "45.0° Cobb",
+  XV.describeMark(mark("cobb", [[0, 0], [100, 0], [0, 0], [100, 100]]), sp, true)
+);
+check("cobbAngle perpendicular = 90", near(XV.cobbAngle([[0, 0], [100, 0], [0, 0], [0, 100]], sp), 90));
+check("cobbAngle parallel = 0", near(XV.cobbAngle([[0, 0], [100, 0], [50, 50], [150, 50]], sp), 0));
+check("cobbAngle ignores which end is first", near(XV.cobbAngle([[100, 0], [0, 0], [0, 0], [100, 100]], sp), 45));
+// circle: centre->edge is 80 px = 10 mm radius, 20 mm across
+const circ = XV.circleMetrics([[0, 0], [80, 0]], sp, true);
+check("circle radius 10 / diameter 20 mm", near(circ.radius, 10) && near(circ.diameter, 20), `${circ.radius}/${circ.diameter}`);
+check(
+  "describeMark circle",
+  XV.describeMark(mark("circle", [[0, 0], [80, 0]]), sp, true) === `⌀ 20.0 · r 10.0 ${XV.DISTANCE_SUFFIX}`,
+  XV.describeMark(mark("circle", [[0, 0], [80, 0]]), sp, true)
+);
+check("circle uncalibrated is px", near(XV.circleMetrics([[0, 0], [80, 0]], sp, false).radius, 80));
+// ellipse: corners 80 px across, 40 px down -> 10 mm x 5 mm axes
+const ell = XV.ellipseMetrics([[10, 10], [90, 50]], sp, true);
+check("ellipse axes 10 x 5 mm", near(ell.major, 10) && near(ell.minor, 5), `${ell.major}/${ell.minor}`);
+check("ellipse major is the longer axis whichever way it was dragged", near(XV.ellipseMetrics([[90, 50], [10, 10]], sp, true).major, 10));
+check(
+  "describeMark ellipse",
+  XV.describeMark(mark("ellipse", [[10, 10], [90, 50]]), sp, true) === `axes 10.0 × 5.0 ${XV.DISTANCE_SUFFIX}`,
+  XV.describeMark(mark("ellipse", [[10, 10], [90, 50]]), sp, true)
+);
+check("describeMark point is its number", XV.describeMark(mark("point", [[5, 5]], { n: 3 }), sp, true) === "3");
+check("describeMark text is its text", XV.describeMark(mark("text", [[5, 5]], { text: "ulna" }), sp, true) === "ulna");
+check("describeMark of an unfinished mark is blank", XV.describeMark(mark("angle", [[0, 0], [1, 1]]), sp, true) === "");
+
+// ------------------------------------------------------------- hit-testing
+// identity transform, so screen px == image px and the sums are readable
+const idt = (p) => [p[0], p[1]];
+const hitMarks = [
+  mark("line", [[0, 0], [100, 0]]),
+  mark("line", [[300, 300], [400, 300]]),
+];
+const h1 = XV.hitTest(hitMarks, [104, 3], idt, 36);
+check("hitTest grabs the nearest handle", h1 && h1.markIndex === 0 && h1.ptIndex === 1, JSON.stringify(h1));
+const h2 = XV.hitTest(hitMarks, [8, -6], idt, 36);
+check("hitTest picks the nearer of two handles", h2 && h2.markIndex === 0 && h2.ptIndex === 0, JSON.stringify(h2));
+check("hitTest misses outside the radius", XV.hitTest(hitMarks, [200, 200], idt, 36) === null);
+check("hitTest at mouse radius 8 misses a 20 px gap", XV.hitTest(hitMarks, [120, 0], idt, 8) === null);
+// the label sits at the last handle + LABEL_OFFSET, so a tap on it beats the handle
+const labelPt = [400 + XV.LABEL_OFFSET[0], 300 + XV.LABEL_OFFSET[1]];
+const h3 = XV.hitTest(hitMarks, labelPt, idt, 36);
+check("hitTest finds the label", h3 && h3.markIndex === 1 && h3.ptIndex === "label", JSON.stringify(h3));
+check("hitTest on empty list is null", XV.hitTest([], [0, 0], idt, 36) === null);
+
+// -------------------------------------------------- exact-value setters
+const angleMark = mark("angle", [[100, 100], [100, 300], [400, 300]]);   // 90.0°
+const turned = XV.setMarkAngle(angleMark, 45, sp);
+check("setMarkAngle rotates the last arm to 45", near(XV.angleDeg(turned[0], turned[1], turned[2], sp), 45, 1e-9), `${XV.angleDeg(turned[0], turned[1], turned[2], sp)}`);
+check(
+  "setMarkAngle keeps the arm length",
+  near(XV.distanceMm(turned[1], turned[2], sp), XV.distanceMm(angleMark.pts[1], angleMark.pts[2], sp), 1e-9)
+);
+check("setMarkAngle leaves the first arm alone", turned[0][0] === 100 && turned[1][1] === 300);
+const cobbMark = mark("cobb", [[0, 0], [100, 0], [0, 0], [100, 100]]);   // 45.0°
+check("setMarkAngle on a cobb sets the inter-line angle", near(XV.cobbAngle(XV.setMarkAngle(cobbMark, 30, sp), sp), 30, 1e-9));
+check("snapAngle 47 -> 45 at 5°", XV.snapAngle(47, 5) === 45);
+check("snapAngle 47.4 -> 47 at 1°", XV.snapAngle(47.4, 1) === 47);
+const scaled = XV.setMarkLength(mark("line", [[100, 200], [400, 600]]), 125, sp, true);   // was 62.5 mm
+check("setMarkLength doubles the line to 125 mm", near(XV.distanceMm(scaled[0], scaled[1], sp), 125, 1e-9));
+check("setMarkLength slides along the same ray", near(scaled[1][0], 700, 1e-9) && near(scaled[1][1], 1000, 1e-9), `${scaled[1]}`);
+const shrunk = XV.setMarkLength(mark("circle", [[0, 0], [80, 0]]), 10, sp, true);   // diameter 10 mm -> r 5 mm
+check("setMarkLength on a circle takes the diameter", near(XV.circleMetrics(shrunk, sp, true).diameter, 10, 1e-9));
+check("setMarkLength in px when uncalibrated", near(XV.distancePx(...XV.setMarkLength(mark("line", [[0, 0], [100, 0]]), 250, sp, false)), 250, 1e-9));
+check("setMarkLength refuses a zero-length ray", XV.setMarkLength(mark("line", [[7, 7], [7, 7]]), 10, sp, true)[1][0] === 7);
+
 // ------------------------------------------------------------- view2d maths
 const bounds = XV.windowBounds(r.pixels);
 check(

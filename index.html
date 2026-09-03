@@ -98,6 +98,24 @@
   .group { display: flex; gap: 6px; align-items: center; }
   #status { flex: 1 1 100%; color: var(--ink-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
   .hide { display: none !important; }
+
+  /* One row of tools: never wraps, scrolls sideways when the screen is too narrow. */
+  #tools { display: flex; gap: 6px; flex: 1 1 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  #tools button { flex: 0 0 auto; padding: 0 12px; white-space: nowrap; }
+
+  #markPop {
+    position: absolute; z-index: 5; display: none; flex-direction: column; gap: 6px;
+    padding: 8px; min-width: 160px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .55);
+  }
+  #markPop.show { display: flex; }
+  #markPop .row { display: flex; gap: 6px; }
+  #markPop input {
+    min-height: var(--tap); flex: 1 1 auto; min-width: 0; padding: 0 8px;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel); color: var(--ink); font: inherit;
+  }
 </style>
 
 <header>
@@ -127,6 +145,7 @@
     <div style="font-size:13px">Tap <strong>Open files</strong> and pick your <code>.dcm</code> files.</div>
   </div>
   <div id="err"></div>
+  <div id="markPop"></div>
 </div>
 
 <div id="controls">
@@ -137,13 +156,21 @@
     <input id="strength" type="range" min="0" max="100" value="100" style="max-width:110px" disabled>
     <span id="strengthValue" style="color:var(--ink-dim);font-size:13px;min-width:38px">100%</span>
   </div>
-  <div class="group">
-    <button id="distance" aria-pressed="false">Distance</button>
-    <button id="angle" aria-pressed="false">Angle</button>
-    <button id="clearMeasure">Clear marks</button>
-    <button id="resetWindow">Reset window</button>
+  <div id="tools">
+    <button id="toolLine" aria-pressed="false">Line</button>
+    <button id="toolAngle" aria-pressed="false">Angle</button>
+    <button id="toolCobb" aria-pressed="false">Cobb</button>
+    <button id="toolCircle" aria-pressed="false">Circle</button>
+    <button id="toolEllipse" aria-pressed="false">Ellipse</button>
+    <button id="toolPoint" aria-pressed="false">Point</button>
+    <button id="toolText" aria-pressed="false">Text</button>
+    <button id="undo" disabled>Undo</button>
+    <button id="redo" disabled>Redo</button>
+    <button id="undoPoint">Undo point</button>
+    <button id="clearMeasure">Clear</button>
   </div>
   <div class="group">
+    <button id="resetWindow">Reset window</button>
     <button id="lock" aria-pressed="false">Lock</button>
     <button id="fit">Fit</button>
     <button id="rotateLeft">Rotate L</button>
@@ -183,10 +210,17 @@
   "use strict";
   var XV = globalThis.XV;
 
-  var MODE_NONE = "none", MODE_DISTANCE = "distance", MODE_ANGLE = "angle";
   var INVERT_STRENGTH_DEFAULT = 100;
   var TAP_SLOP_PX = 10;      // a drag longer than this is a pan, not a point
   var TAP_MAX_MS = 600;
+  var TOOL_BUTTONS = {       // tool name -> its toolbar button id
+    line: "toolLine", angle: "toolAngle", cobb: "toolCobb", circle: "toolCircle",
+    ellipse: "toolEllipse", point: "toolPoint", text: "toolText",
+  };
+  var HIT_RADIUS_TOUCH = 36, HIT_RADIUS_MOUSE = 8;   // css px, Datum's grab tolerance
+  var LOUPE_RADIUS = 60, LOUPE_LIFT = 80, LOUPE_ZOOM = 2;  // css px
+  var UNDO_CAP = 50;
+  var MARK_COLOUR = "#ffcc00", REFERENCE_COLOUR = "#7fd6ff";
 
   var el = function (id) { return document.getElementById(id); };
   var stage = el("stage"), canvas = el("canvas"), ctx = canvas.getContext("2d");
@@ -195,9 +229,13 @@
   var films = [];            // parsed radiographs
   var current = -1;
   var levels = [];           // per-film [lo, hi], survives switching films
-  var mode = MODE_NONE;
-  var pending = [];          // measurement points awaiting the full set
-  var marks = [];            // {points, text} already placed, per film index
+  var tool = null;           // null = view mode; otherwise a key of TOOL_BUTTONS
+  var pending = [];          // image-px points of the mark being placed
+  var hover = null;          // live point under the pen/mouse, for the rubber band
+  var marks = [];            // per film index: [{id, type, pts, meta}], all in image px
+  var undoStack = [], redoStack = [];   // snapshots of marks[current], newest last
+  var loupe = null;          // {x, y} in canvas px while a finger drags a handle
+  var popMark = -1;          // index of the mark whose popover is open
   var invertOn = false, invertStrength = INVERT_STRENGTH_DEFAULT;
   var xform = { scale: 1, tx: 0, ty: 0, rot: 0 };   // rot in radians, clockwise on screen
   var locked = false;        // padlock: no pan, zoom, twist — taps still place points
@@ -298,6 +336,9 @@
     if (index < 0 || index >= films.length) return;
     current = index;
     cancelMeasurement();
+    // The stack holds snapshots of one film's marks, so switching films starts a fresh one.
+    undoStack = []; redoStack = [];
+    syncUndoButtons();
     emptyBox.classList.add("hide");
     syncSliders();
     greyDirty = true;
@@ -432,88 +473,336 @@
     ctx.setTransform(s * cos, s * sin, -s * sin, s * cos, xform.tx, xform.ty);
     ctx.drawImage(greyCanvas, 0, 0);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    drawMarks();
+    drawMarks(xform);
+    drawLoupe();
   }
 
-  function toScreen(p) {
-    return XV.imageToScreen(p, xform);
+  function dprNow() { return Math.min(window.devicePixelRatio || 1, 2); }
+
+  function toScreen(p, xf) {
+    return XV.imageToScreen(p, xf || xform);
   }
 
-  function drawPolyline(points, withText) {
-    var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    ctx.strokeStyle = "#ffcc00";
-    ctx.fillStyle = "#ffcc00";
+  function spacingNow() {
+    var f = film();
+    return f && f.spacingIsValid ? f.spacingMm : [1.0, 1.0];
+  }
+
+  function isCalibrated() {
+    var f = film();
+    return !!(f && f.spacingIsValid);
+  }
+
+  function labelOf(mark) {
+    return XV.describeMark(mark, spacingNow(), isCalibrated());
+  }
+
+  /* One mark, in whatever transform it is asked for (the loupe passes its own). Shapes are
+   * built in screen space so rotation and zoom come along for free.
+   */
+  function drawMark(mark, xf, live) {
+    var dpr = dprNow();
+    var pts = mark.pts || [];
+    if (!pts.length) return;
+    var colour = mark.meta && mark.meta.reference ? REFERENCE_COLOUR : MARK_COLOUR;
+    ctx.save();
+    ctx.strokeStyle = colour;
+    ctx.fillStyle = colour;
     ctx.lineWidth = 2 * dpr;
+    ctx.setLineDash(live ? [6 * dpr, 5 * dpr] : []);
+    var s = pts.map(function (p) { return toScreen(p, xf); });
     ctx.beginPath();
-    points.forEach(function (p, i) {
-      var s = toScreen(p);
-      if (i === 0) ctx.moveTo(s[0], s[1]); else ctx.lineTo(s[0], s[1]);
-    });
+    if (mark.type === "circle" && s.length >= 2) {
+      ctx.arc(s[0][0], s[0][1], Math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]), 0, Math.PI * 2);
+    } else if (mark.type === "ellipse" && s.length >= 2) {
+      var mid = toScreen([(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2], xf);
+      var scale = (xf || xform).scale;
+      ctx.ellipse(
+        mid[0], mid[1],
+        Math.abs(pts[1][0] - pts[0][0]) * scale / 2, Math.abs(pts[1][1] - pts[0][1]) * scale / 2,
+        (xf || xform).rot, 0, Math.PI * 2
+      );
+    } else if (mark.type === "cobb") {
+      ctx.moveTo(s[0][0], s[0][1]);
+      if (s.length >= 2) ctx.lineTo(s[1][0], s[1][1]);
+      if (s.length >= 3) { ctx.moveTo(s[2][0], s[2][1]); if (s.length >= 4) ctx.lineTo(s[3][0], s[3][1]); }
+    } else {
+      s.forEach(function (p, i) { if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]); });
+    }
     ctx.stroke();
-    points.forEach(function (p) {
-      var s = toScreen(p);
+    ctx.setLineDash([]);
+    s.forEach(function (p) {
       ctx.beginPath();
-      ctx.arc(s[0], s[1], 4 * dpr, 0, Math.PI * 2);
+      ctx.arc(p[0], p[1], 4 * dpr, 0, Math.PI * 2);
       ctx.fill();
     });
-    if (withText) {
-      var last = toScreen(points[points.length - 1]);
+    var text = labelOf(mark);
+    if (text) {
+      var last = s[s.length - 1];
       ctx.font = (13 * dpr) + "px -apple-system, system-ui, sans-serif";
       ctx.textBaseline = "bottom";
-      ctx.fillText(withText, last[0] + 8 * dpr, last[1] - 6 * dpr);
+      // XV.LABEL_OFFSET so the label lands exactly where XV.hitTest looks for it.
+      ctx.fillText(text, last[0] + XV.LABEL_OFFSET[0], last[1] + XV.LABEL_OFFSET[1]);
     }
+    ctx.restore();
   }
 
-  function drawMarks() {
+  function drawMarks(xf) {
     if (current < 0) return;
-    (marks[current] || []).forEach(function (m) { drawPolyline(m.points, m.text); });
-    if (pending.length) drawPolyline(pending, "");
+    (marks[current] || []).forEach(function (m) { drawMark(m, xf, false); });
+    if (pending.length) drawMark(previewMark(), xf, true);
+  }
+
+  /** The mark being placed, with the live point under the pen/mouse on the end of it. */
+  function previewMark() {
+    var pts = pending.slice();
+    if (hover && pts.length < (XV.POINTS_NEEDED[tool] || 0)) pts.push(hover);
+    return { id: "preview", type: tool, pts: pts, meta: {} };
+  }
+
+  /* 2× magnifier under a dragging finger: the same scene re-drawn through a doubled
+   * transform, clipped to a circle lifted clear of the fingertip.
+   */
+  function drawLoupe() {
+    if (!loupe || !film()) return;
+    var dpr = dprNow();
+    var r = LOUPE_RADIUS * dpr;
+    var cx = loupe.x, cy = loupe.y - LOUPE_LIFT * dpr;
+    var anchor = XV.screenToImage([loupe.x, loupe.y], xform);
+    var scale = xform.scale * LOUPE_ZOOM;
+    var t = XV.translationFixing(anchor, [cx, cy], scale, xform.rot);
+    var xf = { scale: scale, tx: t[0], ty: t[1], rot: xform.rot };
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+    var cos = Math.cos(xf.rot), sin = Math.sin(xf.rot);
+    ctx.setTransform(scale * cos, scale * sin, -scale * sin, scale * cos, xf.tx, xf.ty);
+    ctx.drawImage(greyCanvas, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    drawMarks(xf);
+    ctx.restore();
+    ctx.save();
+    ctx.strokeStyle = MARK_COLOUR;
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - 10 * dpr, cy); ctx.lineTo(cx + 10 * dpr, cy);
+    ctx.moveTo(cx, cy - 10 * dpr); ctx.lineTo(cx, cy + 10 * dpr);
+    ctx.stroke();
+    ctx.restore();
   }
 
   // ------------------------------------------------------------ measuring
-  function setMode(next) {
-    pending = [];
-    mode = mode === next ? MODE_NONE : next;
-    el("distance").setAttribute("aria-pressed", String(mode === MODE_DISTANCE));
-    el("angle").setAttribute("aria-pressed", String(mode === MODE_ANGLE));
-    updateStatus(mode === MODE_NONE ? "" : "tap points");
-    requestDraw();
+  function toolMode() { return tool || XV.MODE_VIEW; }
+
+  function markId() {
+    return "m" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   }
 
-  function cancelMeasurement() {
-    pending = [];
-    mode = MODE_NONE;
-    el("distance").setAttribute("aria-pressed", "false");
-    el("angle").setAttribute("aria-pressed", "false");
+  function cloneMarks(list) {
+    return (list || []).map(function (m) {
+      var meta = {};
+      Object.keys(m.meta || {}).forEach(function (k) { meta[k] = m.meta[k]; });
+      return { id: m.id, type: m.type, pts: m.pts.map(function (p) { return p.slice(); }), meta: meta };
+    });
   }
 
-  function clearMeasurements() {
-    if (current >= 0) marks[current] = [];
-    pending = [];
+  function pushUndo() {
+    if (current < 0) return;
+    undoStack.push(cloneMarks(marks[current]));
+    if (undoStack.length > UNDO_CAP) undoStack.shift();
+    redoStack = [];
+    syncUndoButtons();
+  }
+
+  function syncUndoButtons() {
+    el("undo").disabled = !undoStack.length;
+    el("redo").disabled = !redoStack.length;
+  }
+
+  function afterEdit() {
+    hidePopover();
+    syncUndoButtons();
     requestDraw();
     updateStatus();
   }
 
+  function undo() {
+    if (current < 0 || !undoStack.length) return;
+    redoStack.push(cloneMarks(marks[current]));
+    marks[current] = undoStack.pop();
+    pending = [];
+    afterEdit();
+  }
+
+  function redo() {
+    if (current < 0 || !redoStack.length) return;
+    undoStack.push(cloneMarks(marks[current]));
+    marks[current] = redoStack.pop();
+    pending = [];
+    afterEdit();
+  }
+
+  function setTool(next) {
+    tool = tool === next ? null : next;
+    pending = [];
+    hover = null;
+    hidePopover();
+    Object.keys(TOOL_BUTTONS).forEach(function (name) {
+      el(TOOL_BUTTONS[name]).setAttribute("aria-pressed", String(tool === name));
+    });
+    updateStatus(tool ? "tap " + XV.POINTS_NEEDED[tool] + " point(s)" : "");
+    requestDraw();
+  }
+
+  function cancelMeasurement() {
+    tool = null;
+    pending = [];
+    hover = null;
+    hidePopover();
+    Object.keys(TOOL_BUTTONS).forEach(function (name) {
+      el(TOOL_BUTTONS[name]).setAttribute("aria-pressed", "false");
+    });
+  }
+
+  function clearMeasurements() {
+    if (current >= 0 && (marks[current] || []).length) pushUndo();
+    if (current >= 0) marks[current] = [];
+    pending = [];
+    afterEdit();
+  }
+
+  /** Drop the point placed last; with nothing pending, drop the last whole mark. */
+  function undoLastPoint() {
+    if (pending.length) { pending.pop(); requestDraw(); updateStatus(); return; }
+    if (current < 0 || !(marks[current] || []).length) return;
+    pushUndo();
+    marks[current].pop();
+    afterEdit();
+  }
+
   function addPoint(x, y) {
     var f = film();
-    if (!f || mode === MODE_NONE) return;
+    if (!f || !tool) return;
+    var needed = XV.POINTS_NEEDED[tool] || 0;
     pending.push([x, y]);
-    var needed = mode === MODE_DISTANCE ? 2 : 3;
     if (pending.length < needed) {
       updateStatus(pending.length + "/" + needed + " points");
       requestDraw();
       return;
     }
-    var points = pending.slice();
+    var pts = pending.slice();
     pending = [];
-    var calibrated = f.spacingIsValid;
-    var spacing = calibrated ? f.spacingMm : [1.0, 1.0];
-    var text = mode === MODE_DISTANCE
-      ? XV.formatDistance(points[0], points[1], spacing, calibrated)
-      : XV.formatAngle(points[0], points[1], points[2], spacing);
-    marks[current].push({ points: points, text: text });
-    updateStatus(text);
+    commitMark(pts);
+  }
+
+  function commitMark(pts) {
+    var meta = {};
+    if (tool === "point") {
+      meta.n = (marks[current] || []).filter(function (m) { return m.type === "point"; }).length + 1;
+    }
+    if (tool === "text") {
+      // ponytail: window.prompt is the whole text editor (no deps, no keyboard plumbing);
+      // upgrade path is an inline contenteditable label anchored to the mark.
+      var typed = window.prompt("Label text", "");
+      if (!typed) { requestDraw(); return; }
+      meta.text = typed;
+    }
+    pushUndo();
+    var mark = { id: markId(), type: tool, pts: pts, meta: meta };
+    marks[current].push(mark);
+    updateStatus(labelOf(mark));
     requestDraw();
+  }
+
+  // -------------------------------------------------------------- popover
+  function hidePopover() {
+    popMark = -1;
+    el("markPop").classList.remove("show");
+  }
+
+  /** The one number the popover lets you type for this mark. */
+  function exactValueOf(mark) {
+    var sp = spacingNow();
+    if (mark.type === "angle") return XV.angleDeg(mark.pts[0], mark.pts[1], mark.pts[2], sp);
+    if (mark.type === "cobb") return XV.cobbAngle(mark.pts, sp);
+    if (mark.type === "circle") return XV.circleMetrics(mark.pts, sp, isCalibrated()).diameter;
+    return isCalibrated() ? XV.distanceMm(mark.pts[0], mark.pts[1], sp) : XV.distancePx(mark.pts[0], mark.pts[1]);
+  }
+
+  function applyExact(index, value) {
+    var m = marks[current][index];
+    if (!Number.isFinite(value)) return;
+    pushUndo();
+    m.pts = (m.type === "angle" || m.type === "cobb")
+      ? XV.setMarkAngle(m, value, spacingNow())
+      : XV.setMarkLength(m, value, spacingNow(), isCalibrated());
+    updateStatus(labelOf(m));
+    afterEdit();
+  }
+
+  function snapMarkAngle(index, step) {
+    var m = marks[current][index];
+    pushUndo();
+    m.pts = XV.setMarkAngle(m, XV.snapAngle(exactValueOf(m), step), spacingNow());
+    updateStatus(labelOf(m));
+    afterEdit();
+  }
+
+  function showPopover(index, at) {
+    var m = marks[current][index];
+    if (!m) return;
+    popMark = index;
+    var pop = el("markPop");
+    pop.innerHTML = "";
+    var button = function (text, onclick) {
+      var b = document.createElement("button");
+      b.textContent = text;
+      b.onclick = onclick;
+      return b;
+    };
+    pop.appendChild(button("Delete", function () {
+      pushUndo();
+      marks[current].splice(index, 1);
+      afterEdit();
+    }));
+    if (m.type === "angle" || m.type === "cobb") {
+      var snapRow = document.createElement("div");
+      snapRow.className = "row";
+      [1, 5].forEach(function (step) {
+        snapRow.appendChild(button("Snap " + step + "°", function () { snapMarkAngle(index, step); }));
+      });
+      pop.appendChild(snapRow);
+    }
+    if (["angle", "cobb", "line", "circle"].indexOf(m.type) >= 0) {
+      var row = document.createElement("div");
+      row.className = "row";
+      var input = document.createElement("input");
+      input.type = "number";
+      input.step = "0.1";
+      input.value = exactValueOf(m).toFixed(1);
+      row.appendChild(input);
+      row.appendChild(button("Set", function () { applyExact(index, Number(input.value)); }));
+      pop.appendChild(row);
+    }
+    pop.appendChild(button(m.meta.reference ? "Reference ✓" : "Set as reference", function () {
+      pushUndo();
+      marks[current].forEach(function (other) { if (other.meta) other.meta.reference = false; });
+      m.meta.reference = true;
+      afterEdit();
+    }));
+    pop.appendChild(button("Close", hidePopover));
+    var dpr = dprNow();
+    var box = stage.getBoundingClientRect();
+    pop.classList.add("show");
+    var w = pop.offsetWidth || 170, h = pop.offsetHeight || 180;
+    pop.style.left = Math.max(4, Math.min(at.x / dpr - w / 2, box.width - w - 4)) + "px";
+    pop.style.top = Math.max(4, Math.min(at.y / dpr + 16, box.height - h - 4)) + "px";
   }
 
   function updateStatus(message) {
@@ -546,7 +835,17 @@
     // browser refuses it the gesture must still work, so a failure here is not fatal.
     try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* no capture, still tracked below */ }
     var p = localPoint(ev);
-    pointers.set(ev.pointerId, { start: p, last: p, moved: 0, time: Date.now(), type: ev.pointerType, multi: false });
+    var rec = { start: p, last: p, moved: 0, time: Date.now(), type: ev.pointerType, multi: false, edit: null };
+    pointers.set(ev.pointerId, rec);
+    // A handle is only grabbable while a tool is armed: pan and pinch never touch marks.
+    if (pointers.size === 1 && XV.gestureFor(rec.type, toolMode(), 1, locked) === "place" && !pending.length) {
+      var hit = XV.hitTest(marks[current] || [], [p.x, p.y], toScreen, hitRadius(rec.type));
+      if (hit) rec.edit = { hit: hit, last: imagePoint(p), pushed: false };
+    }
+    if (!rec.edit && rec.type === "pen" && XV.gestureFor(rec.type, toolMode(), 1, locked) === "place") {
+      hover = imagePoint(p);   // pen: rubber-band from the moment it touches down
+      requestDraw();
+    }
     if (pointers.size >= 2) {
       // A pointer that was ever part of a two-finger gesture must not also place a point.
       pointers.forEach(function (rec) { rec.multi = true; });
@@ -568,15 +867,56 @@
     };
   }
 
+  function hitRadius(pointerType) {
+    return (pointerType === "mouse" ? HIT_RADIUS_MOUSE : HIT_RADIUS_TOUCH) * dprNow();
+  }
+
+  /** Move one handle, or (for a label grab) the whole mark, by an image-px delta. */
+  function dragMark(edit, to) {
+    var m = marks[current][edit.hit.markIndex];
+    if (!m) return;
+    var dx = to[0] - edit.last[0], dy = to[1] - edit.last[1];
+    if (edit.hit.ptIndex === "label") {
+      m.pts.forEach(function (pt) { pt[0] += dx; pt[1] += dy; });
+    } else {
+      var pt = m.pts[edit.hit.ptIndex];
+      pt[0] += dx; pt[1] += dy;
+    }
+    edit.last = to;
+    updateStatus(labelOf(m));
+  }
+
   canvas.addEventListener("pointermove", function (ev) {
     var rec = pointers.get(ev.pointerId);
-    if (!rec || !film()) return;
+    if (!rec) {
+      // No button down: a mouse still gets a live preview of the point it is about to place.
+      if (film() && tool && pending.length && ev.pointerType === "mouse") {
+        hover = imagePoint(localPoint(ev));
+        requestDraw();
+      }
+      return;
+    }
+    if (!film()) return;
     var p = localPoint(ev);
     rec.moved += Math.hypot(p.x - rec.last.x, p.y - rec.last.y);
     var prev = rec.last;
     rec.last = p;
 
-    var g = XV.gestureFor(rec.type, mode, pointers.size, locked);
+    if (rec.edit && pointers.size === 1) {
+      if (!rec.edit.pushed) { pushUndo(); rec.edit.pushed = true; }
+      dragMark(rec.edit, imagePoint(p));
+      // 2.4: only a finger hides what it is dragging, so only a finger gets the loupe.
+      loupe = rec.type === "touch" && rec.edit.hit.ptIndex !== "label" ? { x: p.x, y: p.y } : null;
+      requestDraw();
+      return;
+    }
+
+    var g = XV.gestureFor(rec.type, toolMode(), pointers.size, locked);
+    if (g === "place" && rec.type === "pen") {
+      hover = imagePoint(p);   // 2.2: the pen drags a rubber band and drops on lift
+      requestDraw();
+      return;
+    }
     if (g === "pan") {
       xform.tx += p.x - prev.x;
       xform.ty += p.y - prev.y;
@@ -607,12 +947,20 @@
     var rec = pointers.get(ev.pointerId);
     pointers.delete(ev.pointerId);
     if (pointers.size < 2) gesture = null;
-    if (!rec || !film()) return;
-    if (rec.multi || XV.gestureFor(rec.type, mode, 1, locked) !== "place") return;
-    var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    // ponytail: a pen places wherever it lifts (it can never pan, so a slide is still aim);
-    // a finger still has to tap, because a finger that slid meant to pan. The rubber-band
-    // preview between pen-down and pen-up is Phase 2.2.
+    loupe = null;
+    hover = null;
+    if (!rec || !film()) { requestDraw(); return; }
+    if (rec.edit) {
+      // A grab that never moved is a tap: on a label that opens the popover, on a handle nothing.
+      if (!rec.edit.pushed && rec.edit.hit.ptIndex === "label") showPopover(rec.edit.hit.markIndex, rec.last);
+      requestDraw();
+      return;
+    }
+    hidePopover();
+    if (rec.multi || XV.gestureFor(rec.type, toolMode(), 1, locked) !== "place") { requestDraw(); return; }
+    var dpr = dprNow();
+    // A pen places wherever it lifts (it can never pan, so a slide is aim, shown as a
+    // rubber band); a finger still has to tap, because a finger that slid meant to pan.
     var tapped = rec.type === "pen" || (rec.moved < TAP_SLOP_PX * dpr && Date.now() - rec.time < TAP_MAX_MS);
     if (tapped) {
       var ip = imagePoint(rec.last);
@@ -652,6 +1000,8 @@
   el("clear").onclick = function () {
     films = []; levels = []; marks = []; current = -1;
     cancelMeasurement();
+    undoStack = []; redoStack = [];
+    syncUndoButtons();
     renderViews();
     emptyBox.classList.remove("hide");
     showError("");
@@ -679,8 +1029,12 @@
     greyDirty = true;
     requestDraw();
   };
-  el("distance").onclick = function () { setMode(MODE_DISTANCE); };
-  el("angle").onclick = function () { setMode(MODE_ANGLE); };
+  Object.keys(TOOL_BUTTONS).forEach(function (name) {
+    el(TOOL_BUTTONS[name]).onclick = function () { setTool(name); };
+  });
+  el("undo").onclick = undo;
+  el("redo").onclick = redo;
+  el("undoPoint").onclick = undoLastPoint;
   el("clearMeasure").onclick = clearMeasurements;
   el("resetWindow").onclick = resetWindow;
   el("fit").onclick = fitToStage;
