@@ -103,19 +103,27 @@
   #tools { display: flex; gap: 6px; flex: 1 1 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
   #tools button { flex: 0 0 auto; padding: 0 12px; white-space: nowrap; }
 
-  #markPop {
+  /* Markup row: hidden until Markup is on, then a second scrolling row of tools. */
+  #markupTools { display: flex; gap: 6px; flex: 1 1 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  #markupTools button { flex: 0 0 auto; padding: 0 12px; white-space: nowrap; }
+  #swatches, #widths { display: flex; gap: 6px; flex: 0 0 auto; }
+  .swatch { padding: 0; width: var(--tap); border-radius: 12px; border: 2px solid var(--line); }
+  .swatch[aria-pressed="true"] { border-color: var(--ink); border-width: 3px; }
+
+  #markPop, #calibPop {
     position: absolute; z-index: 5; display: none; flex-direction: column; gap: 6px;
     padding: 8px; min-width: 160px;
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
     box-shadow: 0 6px 24px rgba(0, 0, 0, .55);
   }
-  #markPop.show { display: flex; }
-  #markPop .row { display: flex; gap: 6px; }
-  #markPop input {
+  #markPop.show, #calibPop.show { display: flex; }
+  #markPop .row, #calibPop .row { display: flex; gap: 6px; }
+  #markPop input, #calibPop input {
     min-height: var(--tap); flex: 1 1 auto; min-width: 0; padding: 0 8px;
     border: 1px solid var(--line); border-radius: 10px;
     background: var(--panel); color: var(--ink); font: inherit;
   }
+  #calibPop .hint { color: var(--ink-dim); font-size: 12px; max-width: 220px; }
 </style>
 
 <header>
@@ -146,6 +154,21 @@
   </div>
   <div id="err"></div>
   <div id="markPop"></div>
+  <div id="calibPop">
+    <div class="hint">Type the real length of the line you just drew.</div>
+    <div class="row">
+      <input id="calibValue" type="number" step="0.1" min="0" inputmode="decimal" placeholder="Real length">
+      <select id="calibUnit">
+        <option value="mm">mm</option>
+        <option value="cm">cm</option>
+        <option value="in">in</option>
+      </select>
+    </div>
+    <div class="row">
+      <button id="calibApply">Apply</button>
+      <button id="calibCancel">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <div id="controls">
@@ -164,10 +187,25 @@
     <button id="toolEllipse" aria-pressed="false">Ellipse</button>
     <button id="toolPoint" aria-pressed="false">Point</button>
     <button id="toolText" aria-pressed="false">Text</button>
+    <button id="toolCalibrate" aria-pressed="false">Calibrate</button>
+    <button id="clearCalib" disabled>Clear calibration</button>
+    <button id="markup" aria-pressed="false">Markup</button>
+    <button id="savePng">Save PNG</button>
     <button id="undo" disabled>Undo</button>
     <button id="redo" disabled>Redo</button>
     <button id="undoPoint">Undo point</button>
     <button id="clearMeasure">Clear</button>
+  </div>
+  <div id="markupTools" class="hide">
+    <button id="mkInk" aria-pressed="false">Pen</button>
+    <button id="mkHilite" aria-pressed="false">Highlighter</button>
+    <button id="mkArrow" aria-pressed="false">Arrow</button>
+    <button id="mkRect" aria-pressed="false">Rect</button>
+    <button id="mkEllipse" aria-pressed="false">Circle</button>
+    <button id="mkNote" aria-pressed="false">Text</button>
+    <button id="mkEraser" aria-pressed="false">Eraser</button>
+    <span id="swatches"></span>
+    <span id="widths"></span>
   </div>
   <div class="group">
     <button id="resetWindow">Reset window</button>
@@ -215,8 +253,18 @@
   var TAP_MAX_MS = 600;
   var TOOL_BUTTONS = {       // tool name -> its toolbar button id
     line: "toolLine", angle: "toolAngle", cobb: "toolCobb", circle: "toolCircle",
-    ellipse: "toolEllipse", point: "toolPoint", text: "toolText",
+    ellipse: "toolEllipse", point: "toolPoint", text: "toolText", calibrate: "toolCalibrate",
   };
+  var MARKUP_BUTTONS = {     // the second row, revealed by the Markup toggle
+    ink: "mkInk", hilite: "mkHilite", arrow: "mkArrow", rect: "mkRect",
+    ellipseShape: "mkEllipse", note: "mkNote", eraser: "mkEraser",
+  };
+  var MARKUP_COLOURS = ["#ff3b30", "#ff9500", "#ffcc00", "#34c759", "#007aff", "#ffffff"];
+  var MARKUP_WIDTHS = [3, 8, 20];      // image px, so ink keeps its size on the film through zoom
+  var INK_TOLERANCE = 1.5;             // image px, Ramer-Douglas-Peucker
+  var HILITE_ALPHA = 0.35, HILITE_WIDEN = 3;
+  var ERASE_RADIUS = 22;               // css px around the touch that counts as "on the stroke"
+  var SAVE_DEBOUNCE_MS = 500;
   var HIT_RADIUS_TOUCH = 36, HIT_RADIUS_MOUSE = 8;   // css px, Datum's grab tolerance
   var LOUPE_RADIUS = 60, LOUPE_LIFT = 80, LOUPE_ZOOM = 2;  // css px
   var UNDO_CAP = 50;
@@ -236,6 +284,10 @@
   var undoStack = [], redoStack = [];   // snapshots of marks[current], newest last
   var loupe = null;          // {x, y} in canvas px while a finger drags a handle
   var popMark = -1;          // index of the mark whose popover is open
+  var markupOn = false;      // is the markup row showing
+  var inkColour = MARKUP_COLOURS[0], inkWidth = MARKUP_WIDTHS[1];
+  var liveStroke = null;     // image-px points of the freehand stroke under the pen right now
+  var calibLine = null;      // the two image-px points waiting for a typed real length
   var invertOn = false, invertStrength = INVERT_STRENGTH_DEFAULT;
   var xform = { scale: 1, tx: 0, ty: 0, rot: 0 };   // rot in radians, clockwise on screen
   var locked = false;        // padlock: no pan, zoom, twist — taps still place points
@@ -247,24 +299,27 @@
   // ------------------------------------------------------------ IndexedDB
   // Raw file blobs only: parsing is cheap enough to redo on launch, and storing the
   // bytes means a re-parse always agrees with a fresh Open of the same file.
-  var DB_NAME = "xray-ipad", DB_STORE = "files", DB_VERSION = 1;
+  // The second store, filmMeta, is keyed by the same file name as the blob store and holds
+  // everything the viewer adds to a film: its manual calibration and its marks.
+  var DB_NAME = "xray-ipad", DB_STORE = "files", DB_META = "filmMeta", DB_VERSION = 2;
 
   function openDb() {
     return new Promise(function (resolve, reject) {
       var req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = function () {
         if (!req.result.objectStoreNames.contains(DB_STORE)) req.result.createObjectStore(DB_STORE);
+        if (!req.result.objectStoreNames.contains(DB_META)) req.result.createObjectStore(DB_META);
       };
       req.onsuccess = function () { resolve(req.result); };
       req.onerror = function () { reject(req.error); };
     });
   }
 
-  function dbTx(mode, run) {
+  function dbTx(storeName, mode, run) {
     return openDb().then(function (db) {
       return new Promise(function (resolve, reject) {
-        var tx = db.transaction(DB_STORE, mode);
-        var out = run(tx.objectStore(DB_STORE));
+        var tx = db.transaction(storeName, mode);
+        var out = run(tx.objectStore(storeName));
         tx.oncomplete = function () { resolve(out && out.result !== undefined ? out.result : out); };
         tx.onerror = function () { reject(tx.error); };
       });
@@ -272,17 +327,71 @@
   }
 
   function storeFiles(fileList) {
-    return dbTx("readwrite", function (store) {
+    return dbTx(DB_STORE, "readwrite", function (store) {
       for (var i = 0; i < fileList.length; i++) store.put(fileList[i], fileList[i].name);
     });
   }
 
   function loadStoredFiles() {
-    return dbTx("readonly", function (store) { return store.getAll(); }).catch(function () { return []; });
+    return dbTx(DB_STORE, "readonly", function (store) { return store.getAll(); }).catch(function () { return []; });
+  }
+
+  function saveFilmMeta(record) {
+    return dbTx(DB_META, "readwrite", function (store) { store.put(record, record.name); });
+  }
+
+  function loadFilmMeta() {
+    return dbTx(DB_META, "readonly", function (store) { return store.getAll(); }).catch(function () { return []; });
   }
 
   function clearStore() {
-    return dbTx("readwrite", function (store) { store.clear(); });
+    return Promise.all([
+      dbTx(DB_STORE, "readwrite", function (store) { store.clear(); }),
+      dbTx(DB_META, "readwrite", function (store) { store.clear(); }),
+    ]);
+  }
+
+  // 4.3: marks and calibration are written 500 ms after the last edit, so a long drag is one
+  // write rather than one per frame. Switching films flushes first, or the film that just lost
+  // focus would lose the edit still sitting in the timer.
+  var saveTimer = null, savePending = null;
+
+  function flushSave() {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    if (!savePending) return;
+    var record = savePending;
+    savePending = null;
+    saveFilmMeta(record).catch(function () { /* full or private: the marks stay in memory */ });
+  }
+
+  function scheduleSave() {
+    var f = film();
+    if (!f) return;
+    savePending = {
+      name: f.name,
+      marks: cloneMarks(marks[current]),
+      calibration: f.dicomSpacing ? { spacingMm: f.spacingMm.slice(), source: f.spacingSource } : null,
+    };
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
+  }
+
+  /** Put stored calibration and marks back on freshly parsed films, matched by file name. */
+  function applyFilmMeta(records) {
+    var byName = {};
+    (records || []).forEach(function (rec) { if (rec && rec.name) byName[rec.name] = rec; });
+    films.forEach(function (f, i) {
+      var rec = byName[f.name];
+      if (!rec) return;
+      if (rec.marks && rec.marks.length) marks[i] = cloneMarks(rec.marks);
+      if (rec.calibration && rec.calibration.spacingMm) {
+        f.dicomSpacing = { spacingMm: f.spacingMm, spacingSource: f.spacingSource, spacingIsValid: f.spacingIsValid };
+        f.spacingMm = rec.calibration.spacingMm.slice();
+        f.spacingSource = rec.calibration.source || "manual";
+        f.spacingIsValid = true;
+      }
+    });
   }
 
   // Asked once; Safari decides. Without it a home-screen app's files can be evicted.
@@ -314,10 +423,13 @@
       films = XV.applyGenericLabels(loaded);
       levels = films.map(function (f) { return f.windowRange.slice(); });
       marks = films.map(function () { return []; });
-      showError(problems.length ? problems.join("\n") : "");
-      renderViews();
-      if (films.length) select(0); else { current = -1; emptyBox.classList.remove("hide"); draw(); }
-      return films.length;
+      return loadFilmMeta().then(function (records) {
+        applyFilmMeta(records);
+        showError(problems.length ? problems.join("\n") : "");
+        renderViews();
+        if (films.length) select(0); else { current = -1; emptyBox.classList.remove("hide"); draw(); }
+        return films.length;
+      });
     });
   }
 
@@ -334,6 +446,7 @@
 
   function select(index) {
     if (index < 0 || index >= films.length) return;
+    flushSave();
     current = index;
     cancelMeasurement();
     // The stack holds snapshots of one film's marks, so switching films starts a fresh one.
@@ -346,6 +459,7 @@
     Array.prototype.forEach.call(viewsBox.children, function (b, i) {
       b.setAttribute("aria-pressed", String(i === current));
     });
+    syncCalibButtons();
     updateStatus();
     if (window.XVApp && window.XVApp.onFilmChange) window.XVApp.onFilmChange();
   }
@@ -473,7 +587,7 @@
     ctx.setTransform(s * cos, s * sin, -s * sin, s * cos, xform.tx, xform.ty);
     ctx.drawImage(greyCanvas, 0, 0);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    drawMarks(xform);
+    drawMarks(ctx, xform, dprNow());
     drawLoupe();
   }
 
@@ -493,71 +607,157 @@
     return !!(f && f.spacingIsValid);
   }
 
-  function labelOf(mark) {
-    return XV.describeMark(mark, spacingNow(), isCalibrated());
+  /** The line marked as the reference, if one is set: every other line labels its Δ from it. */
+  function referenceMark() {
+    var found = (marks[current] || []).filter(function (m) { return m.meta && m.meta.reference; });
+    return found.length ? found[0] : null;
   }
 
-  /* One mark, in whatever transform it is asked for (the loupe passes its own). Shapes are
-   * built in screen space so rotation and zoom come along for free.
+  function labelOf(mark) {
+    return XV.describeMark(mark, spacingNow(), isCalibrated(), { reference: referenceMark() });
+  }
+
+  /* One mark, on whatever context and transform it is asked for (the loupe passes its own,
+   * the PNG export passes an identity one at native film resolution). Shapes are built in
+   * screen space so rotation and zoom come along for free.
    */
-  function drawMark(mark, xf, live) {
-    var dpr = dprNow();
+  function drawMark(c, mark, xf, dpr, live) {
     var pts = mark.pts || [];
     if (!pts.length) return;
     var colour = mark.meta && mark.meta.reference ? REFERENCE_COLOUR : MARK_COLOUR;
-    ctx.save();
-    ctx.strokeStyle = colour;
-    ctx.fillStyle = colour;
-    ctx.lineWidth = 2 * dpr;
-    ctx.setLineDash(live ? [6 * dpr, 5 * dpr] : []);
+    c.save();
+    c.strokeStyle = colour;
+    c.fillStyle = colour;
+    c.lineWidth = 2 * dpr;
+    c.setLineDash(live ? [6 * dpr, 5 * dpr] : []);
     var s = pts.map(function (p) { return toScreen(p, xf); });
-    ctx.beginPath();
+    c.beginPath();
     if (mark.type === "circle" && s.length >= 2) {
-      ctx.arc(s[0][0], s[0][1], Math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]), 0, Math.PI * 2);
+      c.arc(s[0][0], s[0][1], Math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]), 0, Math.PI * 2);
     } else if (mark.type === "ellipse" && s.length >= 2) {
       var mid = toScreen([(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2], xf);
       var scale = (xf || xform).scale;
-      ctx.ellipse(
+      c.ellipse(
         mid[0], mid[1],
         Math.abs(pts[1][0] - pts[0][0]) * scale / 2, Math.abs(pts[1][1] - pts[0][1]) * scale / 2,
         (xf || xform).rot, 0, Math.PI * 2
       );
     } else if (mark.type === "cobb") {
-      ctx.moveTo(s[0][0], s[0][1]);
-      if (s.length >= 2) ctx.lineTo(s[1][0], s[1][1]);
-      if (s.length >= 3) { ctx.moveTo(s[2][0], s[2][1]); if (s.length >= 4) ctx.lineTo(s[3][0], s[3][1]); }
+      c.moveTo(s[0][0], s[0][1]);
+      if (s.length >= 2) c.lineTo(s[1][0], s[1][1]);
+      if (s.length >= 3) { c.moveTo(s[2][0], s[2][1]); if (s.length >= 4) c.lineTo(s[3][0], s[3][1]); }
     } else {
-      s.forEach(function (p, i) { if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]); });
+      s.forEach(function (p, i) { if (i === 0) c.moveTo(p[0], p[1]); else c.lineTo(p[0], p[1]); });
     }
-    ctx.stroke();
-    ctx.setLineDash([]);
+    c.stroke();
+    c.setLineDash([]);
     s.forEach(function (p) {
-      ctx.beginPath();
-      ctx.arc(p[0], p[1], 4 * dpr, 0, Math.PI * 2);
-      ctx.fill();
+      c.beginPath();
+      c.arc(p[0], p[1], 4 * dpr, 0, Math.PI * 2);
+      c.fill();
     });
     var text = labelOf(mark);
     if (text) {
       var last = s[s.length - 1];
-      ctx.font = (13 * dpr) + "px -apple-system, system-ui, sans-serif";
-      ctx.textBaseline = "bottom";
+      c.font = (13 * dpr) + "px -apple-system, system-ui, sans-serif";
+      c.textBaseline = "bottom";
       // XV.LABEL_OFFSET so the label lands exactly where XV.hitTest looks for it.
-      ctx.fillText(text, last[0] + XV.LABEL_OFFSET[0], last[1] + XV.LABEL_OFFSET[1]);
+      c.fillText(text, last[0] + XV.LABEL_OFFSET[0], last[1] + XV.LABEL_OFFSET[1]);
     }
-    ctx.restore();
+    c.restore();
   }
 
-  function drawMarks(xf) {
+  /* The outline a markup shape is erased by: rect and circle are stored as two opposite
+   * corners, so the eraser walks their bounding ring.
+   * ponytail: a circle is erased by its bounding box, not its curve — a tap just inside a
+   * corner still erases it. Upgrade path: an ellipse-specific distance in viewer-core.
+   */
+  function markPolyline(m) {
+    var pts = m.pts || [];
+    if ((m.type === "rect" || m.type === "ellipseShape") && pts.length >= 2) {
+      var a = pts[0], b = pts[1];
+      return [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]], [a[0], a[1]]];
+    }
+    return pts;
+  }
+
+  function drawArrowHead(c, from, to, width) {
+    var a = Math.atan2(to[1] - from[1], to[0] - from[0]);
+    var len = Math.max(8, width * 3);
+    c.beginPath();
+    c.moveTo(to[0], to[1]);
+    c.lineTo(to[0] - len * Math.cos(a - 0.4), to[1] - len * Math.sin(a - 0.4));
+    c.lineTo(to[0] - len * Math.cos(a + 0.4), to[1] - len * Math.sin(a + 0.4));
+    c.closePath();
+    c.fill();
+  }
+
+  /** A markup stroke: its own colour, its width measured on the film so zoom scales it. */
+  function drawMarkupMark(c, mark, xf, dpr) {
+    var pts = mark.pts || [];
+    if (!pts.length) return;
+    var meta = mark.meta || {};
+    var scale = (xf || xform).scale;
+    var width = Math.max(1, (meta.width || MARKUP_WIDTHS[1]) * scale);
+    var s = pts.map(function (p) { return toScreen(p, xf); });
+    c.save();
+    c.strokeStyle = meta.color || MARKUP_COLOURS[0];
+    c.fillStyle = c.strokeStyle;
+    c.lineJoin = "round";
+    c.lineCap = "round";
+    c.lineWidth = width;
+    if (mark.type === "hilite") { c.globalAlpha = HILITE_ALPHA; c.lineWidth = width * HILITE_WIDEN; }
+    if (mark.type === "note") {
+      c.font = "600 " + (16 * dpr) + "px -apple-system, system-ui, sans-serif";
+      c.textBaseline = "bottom";
+      c.fillText(meta.text || "", s[0][0], s[0][1]);
+      c.restore();
+      return;
+    }
+    c.beginPath();
+    if (mark.type === "ellipseShape" && s.length >= 2) {
+      var mid = toScreen([(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2], xf);
+      c.ellipse(
+        mid[0], mid[1],
+        Math.abs(pts[1][0] - pts[0][0]) * scale / 2, Math.abs(pts[1][1] - pts[0][1]) * scale / 2,
+        (xf || xform).rot, 0, Math.PI * 2
+      );
+    } else if (mark.type === "rect" && s.length >= 2) {
+      markPolyline(mark).map(function (p) { return toScreen(p, xf); })
+        .forEach(function (p, i) { if (i === 0) c.moveTo(p[0], p[1]); else c.lineTo(p[0], p[1]); });
+    } else {
+      s.forEach(function (p, i) { if (i === 0) c.moveTo(p[0], p[1]); else c.lineTo(p[0], p[1]); });
+    }
+    c.stroke();
+    if (mark.type === "arrow" && s.length >= 2) drawArrowHead(c, s[0], s[1], width);
+    c.restore();
+  }
+
+  function drawMarks(c, xf, dpr) {
     if (current < 0) return;
-    (marks[current] || []).forEach(function (m) { drawMark(m, xf, false); });
-    if (pending.length) drawMark(previewMark(), xf, true);
+    var list = marks[current] || [];
+    // Markup first: measurements always stay readable on top of the ink.
+    list.forEach(function (m) { if (XV.isMarkup(m)) drawMarkupMark(c, m, xf, dpr); });
+    list.forEach(function (m) { if (!XV.isMarkup(m)) drawMark(c, m, xf, dpr, false); });
+    if (liveStroke && liveStroke.length > 1) {
+      drawMarkupMark(c, { type: tool, pts: liveStroke, meta: inkMeta() }, xf, dpr);
+    }
+    if (pending.length) {
+      var preview = previewMark();
+      if (XV.isMarkup(preview)) drawMarkupMark(c, preview, xf, dpr);
+      else drawMark(c, preview, xf, dpr, true);
+    }
+  }
+
+  function inkMeta() {
+    return { color: inkColour, width: inkWidth };
   }
 
   /** The mark being placed, with the live point under the pen/mouse on the end of it. */
   function previewMark() {
     var pts = pending.slice();
     if (hover && pts.length < (XV.POINTS_NEEDED[tool] || 0)) pts.push(hover);
-    return { id: "preview", type: tool, pts: pts, meta: {} };
+    return { id: "preview", type: tool, pts: pts, meta: XV.isMarkup({ type: tool }) ? inkMeta() : {} };
   }
 
   /* 2× magnifier under a dragging finger: the same scene re-drawn through a doubled
@@ -582,7 +782,7 @@
     ctx.setTransform(scale * cos, scale * sin, -scale * sin, scale * cos, xf.tx, xf.ty);
     ctx.drawImage(greyCanvas, 0, 0);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    drawMarks(xf);
+    drawMarks(ctx, xf, dpr);
     ctx.restore();
     ctx.save();
     ctx.strokeStyle = MARK_COLOUR;
@@ -628,6 +828,7 @@
   function afterEdit() {
     hidePopover();
     syncUndoButtons();
+    scheduleSave();
     requestDraw();
     updateStatus();
   }
@@ -648,15 +849,37 @@
     afterEdit();
   }
 
+  function toolButtonId(name) {
+    return TOOL_BUTTONS[name] || MARKUP_BUTTONS[name];
+  }
+
+  function allToolNames() {
+    return Object.keys(TOOL_BUTTONS).concat(Object.keys(MARKUP_BUTTONS));
+  }
+
+  function isFreehand() {
+    return tool === "ink" || tool === "hilite";
+  }
+
+  function toolHint() {
+    if (!tool) return "";
+    if (isFreehand()) return "draw with the pen or one finger";
+    if (tool === "eraser") return "tap a markup stroke to erase it";
+    if (tool === "calibrate") return "draw a line across something you know the size of";
+    return "tap " + XV.POINTS_NEEDED[tool] + " point(s)";
+  }
+
   function setTool(next) {
     tool = tool === next ? null : next;
     pending = [];
     hover = null;
+    liveStroke = null;
     hidePopover();
-    Object.keys(TOOL_BUTTONS).forEach(function (name) {
-      el(TOOL_BUTTONS[name]).setAttribute("aria-pressed", String(tool === name));
+    hideCalibForm();
+    allToolNames().forEach(function (name) {
+      el(toolButtonId(name)).setAttribute("aria-pressed", String(tool === name));
     });
-    updateStatus(tool ? "tap " + XV.POINTS_NEEDED[tool] + " point(s)" : "");
+    updateStatus(toolHint());
     requestDraw();
   }
 
@@ -664,9 +887,11 @@
     tool = null;
     pending = [];
     hover = null;
+    liveStroke = null;
     hidePopover();
-    Object.keys(TOOL_BUTTONS).forEach(function (name) {
-      el(TOOL_BUTTONS[name]).setAttribute("aria-pressed", "false");
+    hideCalibForm();
+    allToolNames().forEach(function (name) {
+      el(toolButtonId(name)).setAttribute("aria-pressed", "false");
     });
   }
 
@@ -702,9 +927,17 @@
   }
 
   function commitMark(pts) {
+    if (tool === "calibrate") { showCalibForm(pts); return; }
     var meta = {};
     if (tool === "point") {
       meta.n = (marks[current] || []).filter(function (m) { return m.type === "point"; }).length + 1;
+    }
+    if (XV.isMarkup({ type: tool })) { meta.color = inkColour; meta.width = inkWidth; }
+    if (tool === "note") {
+      // ponytail: same window.prompt shortcut as the text measurement tool.
+      var noteText = window.prompt("Note text", "");
+      if (!noteText) { requestDraw(); return; }
+      meta.text = noteText;
     }
     if (tool === "text") {
       // ponytail: window.prompt is the whole text editor (no deps, no keyboard plumbing);
@@ -717,7 +950,88 @@
     var mark = { id: markId(), type: tool, pts: pts, meta: meta };
     marks[current].push(mark);
     updateStatus(labelOf(mark));
+    scheduleSave();
     requestDraw();
+  }
+
+  /** A freehand stroke, thinned to the points that carry its shape. */
+  function commitStroke(raw) {
+    var pts = XV.simplifyPolyline(raw, INK_TOLERANCE);
+    if (current < 0 || pts.length < 2) return;
+    pushUndo();
+    marks[current].push({ id: markId(), type: tool, pts: pts, meta: inkMeta() });
+    afterEdit();
+  }
+
+  /** Eraser: the topmost markup stroke the touch landed on goes, whole. */
+  function eraseAt(ip) {
+    var list = marks[current] || [];
+    var radius = (ERASE_RADIUS * dprNow()) / (xform.scale || 1);
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (!XV.isMarkup(list[i])) continue;
+      var reach = radius + ((list[i].meta && list[i].meta.width) || 0) / 2;
+      if (XV.polylineDistance(markPolyline(list[i]), ip) <= reach) {
+        pushUndo();
+        list.splice(i, 1);
+        afterEdit();
+        return;
+      }
+    }
+  }
+
+  // ----------------------------------------------------------- calibration
+  // 3.1 (Weasis pattern): the drawn line plus a typed real length fix mm-per-pixel for this
+  // film. Labels are computed at draw time, so marks placed before it relabel themselves.
+  function showCalibForm(pts) {
+    calibLine = pts;
+    var pop = el("calibPop");
+    el("calibValue").value = "";
+    pop.classList.add("show");
+    var box = stage.getBoundingClientRect();
+    var w = pop.offsetWidth || 240, h = pop.offsetHeight || 150;
+    pop.style.left = Math.max(4, (box.width - w) / 2) + "px";
+    pop.style.top = Math.max(4, (box.height - h) / 2) + "px";
+    el("calibValue").focus();
+    requestDraw();
+  }
+
+  function hideCalibForm() {
+    calibLine = null;
+    el("calibPop").classList.remove("show");
+  }
+
+  function applyCalibration() {
+    var f = film();
+    var spacing = calibLine && f
+      ? XV.spacingFromKnownLength(calibLine[0], calibLine[1], Number(el("calibValue").value), el("calibUnit").value)
+      : null;
+    if (!spacing) { showError("Type the real length of the line you drew (a number above zero)."); return; }
+    showError("");
+    if (!f.dicomSpacing) {
+      f.dicomSpacing = { spacingMm: f.spacingMm, spacingSource: f.spacingSource, spacingIsValid: f.spacingIsValid };
+    }
+    f.spacingMm = spacing;
+    f.spacingSource = "manual";
+    f.spacingIsValid = true;
+    hideCalibForm();
+    cancelMeasurement();
+    syncCalibButtons();
+    afterEdit();
+  }
+
+  function clearCalibration() {
+    var f = film();
+    if (!f || !f.dicomSpacing) return;
+    f.spacingMm = f.dicomSpacing.spacingMm;
+    f.spacingSource = f.dicomSpacing.spacingSource;
+    f.spacingIsValid = f.dicomSpacing.spacingIsValid;
+    f.dicomSpacing = null;
+    syncCalibButtons();
+    afterEdit();
+  }
+
+  function syncCalibButtons() {
+    el("clearCalib").disabled = !(film() && film().dicomSpacing);
   }
 
   // -------------------------------------------------------------- popover
@@ -790,6 +1104,13 @@
       row.appendChild(button("Set", function () { applyExact(index, Number(input.value)); }));
       pop.appendChild(row);
     }
+    if (m.type === "line") {
+      pop.appendChild(button(m.meta.tiltAxis === "v" ? "Tilt vs horizontal" : "Tilt vs vertical", function () {
+        pushUndo();
+        m.meta.tiltAxis = m.meta.tiltAxis === "v" ? "h" : "v";
+        afterEdit();
+      }));
+    }
     pop.appendChild(button(m.meta.reference ? "Reference ✓" : "Set as reference", function () {
       pushUndo();
       marks[current].forEach(function (other) { if (other.meta) other.meta.reference = false; });
@@ -811,7 +1132,8 @@
     var lo = levels[current][0], hi = levels[current][1];
     var base = f.label + " — W " + Math.round(hi - lo) + " / L " + Math.round((lo + hi) / 2);
     base += "  " + f.cols + "×" + f.rows;
-    if (!f.spacingIsValid) base += " — uncalibrated (px)";
+    if (f.spacingSource === "manual") base += " — calibrated (manual)";
+    else if (!f.spacingIsValid) base += " — uncalibrated (px)";
     statusBox.textContent = (base + "   " + (message || "")).trim();
   }
 
@@ -835,12 +1157,18 @@
     // browser refuses it the gesture must still work, so a failure here is not fatal.
     try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* no capture, still tracked below */ }
     var p = localPoint(ev);
-    var rec = { start: p, last: p, moved: 0, time: Date.now(), type: ev.pointerType, multi: false, edit: null };
+    var rec = { start: p, last: p, moved: 0, time: Date.now(), type: ev.pointerType, multi: false, edit: null, stroke: null };
     pointers.set(ev.pointerId, rec);
-    // A handle is only grabbable while a tool is armed: pan and pinch never touch marks.
-    if (pointers.size === 1 && XV.gestureFor(rec.type, toolMode(), 1, locked) === "place" && !pending.length) {
+    var placing = XV.gestureFor(rec.type, toolMode(), 1, locked) === "place";
+    // A handle is only grabbable while a measuring tool is armed: pan, pinch, freehand ink and
+    // the eraser never grab one.
+    if (pointers.size === 1 && placing && !pending.length && !isFreehand() && tool !== "eraser") {
       var hit = XV.hitTest(marks[current] || [], [p.x, p.y], toScreen, hitRadius(rec.type));
       if (hit) rec.edit = { hit: hit, last: imagePoint(p), pushed: false };
+    }
+    if (pointers.size === 1 && placing && isFreehand()) {
+      rec.stroke = [imagePoint(p)];
+      liveStroke = rec.stroke;
     }
     if (!rec.edit && rec.type === "pen" && XV.gestureFor(rec.type, toolMode(), 1, locked) === "place") {
       hover = imagePoint(p);   // pen: rubber-band from the moment it touches down
@@ -912,6 +1240,11 @@
     }
 
     var g = XV.gestureFor(rec.type, toolMode(), pointers.size, locked);
+    if (rec.stroke && pointers.size === 1 && g === "place") {
+      rec.stroke.push(imagePoint(p));
+      requestDraw();
+      return;
+    }
     if (g === "place" && rec.type === "pen") {
       hover = imagePoint(p);   // 2.2: the pen drags a rubber band and drops on lift
       requestDraw();
@@ -949,7 +1282,14 @@
     if (pointers.size < 2) gesture = null;
     loupe = null;
     hover = null;
-    if (!rec || !film()) { requestDraw(); return; }
+    if (!rec || !film()) { liveStroke = null; requestDraw(); return; }
+    if (rec.stroke) {
+      liveStroke = null;
+      // A stroke that turned into a two-finger gesture was a pan, not ink.
+      if (!rec.multi) commitStroke(rec.stroke);
+      requestDraw();
+      return;
+    }
     if (rec.edit) {
       // A grab that never moved is a tap: on a label that opens the popover, on a handle nothing.
       if (!rec.edit.pushed && rec.edit.hit.ptIndex === "label") showPopover(rec.edit.hit.markIndex, rec.last);
@@ -965,7 +1305,9 @@
     if (tapped) {
       var ip = imagePoint(rec.last);
       var f = film();
-      if (ip[0] >= 0 && ip[1] >= 0 && ip[0] <= f.cols && ip[1] <= f.rows) addPoint(ip[0], ip[1]);
+      if (ip[0] >= 0 && ip[1] >= 0 && ip[0] <= f.cols && ip[1] <= f.rows) {
+        if (tool === "eraser") eraseAt(ip); else addPoint(ip[0], ip[1]);
+      }
     }
   }
   canvas.addEventListener("pointerup", endPointer);
@@ -985,6 +1327,95 @@
     requestDraw();
   }, { passive: false });
 
+  // ------------------------------------------------------------ export PNG
+  /* 4.2: the windowed film at its own resolution with every mark drawn on top, through the
+   * same drawing code as the screen — an identity transform is all that changes.
+   */
+  function exportPng() {
+    var f = film();
+    if (!f) return;
+    if (greyDirty) rebuildGrey();
+    var out = document.createElement("canvas");
+    out.width = f.cols;
+    out.height = f.rows;
+    var c = out.getContext("2d");
+    c.drawImage(greyCanvas, 0, 0);
+    // Handles and label text are sized in "dpr" units; on a 3000 px film 1 would be unreadable.
+    var dpr = Math.max(1, Math.round(f.cols / 1000));
+    var heldStroke = liveStroke, heldPending = pending;
+    liveStroke = null;
+    pending = [];
+    drawMarks(c, { scale: 1, tx: 0, ty: 0, rot: 0 }, dpr);
+    liveStroke = heldStroke;
+    pending = heldPending;
+    var name = String(f.name || "xray").replace(/\.[^.]*$/, "") + "-marked.png";
+    out.toBlob(function (blob) {
+      if (!blob) { showError("The image could not be turned into a PNG."); return; }
+      deliverPng(blob, name);
+    }, "image/png");
+  }
+
+  /* Share sheet first on a touch device (that is how a file leaves an iPad), download link
+   * everywhere else and whenever the sheet is refused.
+   * ponytail: toBlob is async, so navigator.share runs a tick after the tap and iOS may reject
+   * it as gesture-less; the rejection falls through to the download link.
+   */
+  function deliverPng(blob, name) {
+    var file = null;
+    try { file = new File([blob], name, { type: "image/png" }); }
+    catch (e) { /* no File constructor: download it is */ }
+    var shareable = file && navigator.canShare && navigator.share && navigator.canShare({ files: [file] });
+    if (shareable && navigator.maxTouchPoints > 0) {
+      navigator.share({ files: [file], title: name }).catch(function () { downloadPng(blob, name); });
+      return;
+    }
+    downloadPng(blob, name);
+  }
+
+  function downloadPng(blob, name) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+  }
+
+  // ------------------------------------------------------- markup palette
+  function buildPalette() {
+    var swatches = el("swatches");
+    MARKUP_COLOURS.forEach(function (colour) {
+      var b = document.createElement("button");
+      b.className = "swatch";
+      b.style.background = colour;
+      b.setAttribute("aria-label", "Colour " + colour);
+      b.setAttribute("aria-pressed", String(colour === inkColour));
+      b.onclick = function () {
+        inkColour = colour;
+        Array.prototype.forEach.call(swatches.children, function (other) {
+          other.setAttribute("aria-pressed", String(other === b));
+        });
+      };
+      swatches.appendChild(b);
+    });
+    var widths = el("widths");
+    MARKUP_WIDTHS.forEach(function (width, i) {
+      var b = document.createElement("button");
+      b.textContent = ["Thin", "Med", "Thick"][i];
+      b.setAttribute("aria-pressed", String(width === inkWidth));
+      b.onclick = function () {
+        inkWidth = width;
+        Array.prototype.forEach.call(widths.children, function (other) {
+          other.setAttribute("aria-pressed", String(other === b));
+        });
+      };
+      widths.appendChild(b);
+    });
+  }
+  buildPalette();
+
   // -------------------------------------------------------------- controls
   el("open").onclick = function () { el("file").click(); };
   el("file").onchange = function (ev) {
@@ -998,8 +1429,10 @@
     ev.target.value = "";
   };
   el("clear").onclick = function () {
+    clearTimeout(saveTimer); saveTimer = null; savePending = null;
     films = []; levels = []; marks = []; current = -1;
     cancelMeasurement();
+    syncCalibButtons();
     undoStack = []; redoStack = [];
     syncUndoButtons();
     renderViews();
@@ -1029,9 +1462,20 @@
     greyDirty = true;
     requestDraw();
   };
-  Object.keys(TOOL_BUTTONS).forEach(function (name) {
-    el(TOOL_BUTTONS[name]).onclick = function () { setTool(name); };
+  allToolNames().forEach(function (name) {
+    el(toolButtonId(name)).onclick = function () { setTool(name); };
   });
+  el("markup").onclick = function () {
+    markupOn = !markupOn;
+    el("markup").setAttribute("aria-pressed", String(markupOn));
+    el("markupTools").classList.toggle("hide", !markupOn);
+    if (!markupOn && MARKUP_BUTTONS[tool]) cancelMeasurement();
+    resize();
+  };
+  el("savePng").onclick = exportPng;
+  el("calibApply").onclick = applyCalibration;
+  el("calibCancel").onclick = function () { hideCalibForm(); cancelMeasurement(); requestDraw(); };
+  el("clearCalib").onclick = clearCalibration;
   el("undo").onclick = undo;
   el("redo").onclick = redo;
   el("undoPoint").onclick = undoLastPoint;
@@ -1071,6 +1515,8 @@
     status: function (message) { updateStatus(message); },
   };
 
+  // Leaving the page must not lose the edit still sitting in the 500 ms save timer.
+  window.addEventListener("pagehide", flushSave);
   window.addEventListener("resize", function () { resize(); if (window.ReliefTab) window.ReliefTab.resize(); });
   window.addEventListener("orientationchange", function () {
     setTimeout(function () { resize(); if (window.ReliefTab) window.ReliefTab.resize(); }, 200);

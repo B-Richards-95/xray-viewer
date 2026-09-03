@@ -231,7 +231,15 @@
   // value stored on it: describeMark recomputes the label at draw time, so recalibrating
   // the film relabels marks that were placed before it.
 
-  var POINTS_NEEDED = { line: 2, angle: 3, cobb: 4, circle: 2, ellipse: 2, point: 1, text: 1 };
+  var POINTS_NEEDED = {
+    line: 2, angle: 3, cobb: 4, circle: 2, ellipse: 2, point: 1, text: 1,
+    calibrate: 2,
+    ink: 2, hilite: 2, arrow: 2, rect: 2, ellipseShape: 2, note: 1,
+  };
+  // Markup strokes live in the same marks array as measurements but carry no measured
+  // value, are never edited by handle, and draw underneath everything measured.
+  var MARKUP_TYPES = { ink: 1, hilite: 1, arrow: 1, rect: 1, ellipseShape: 1, note: 1 };
+  var MM_PER_UNIT = { mm: 1.0, cm: 10.0, in: 25.4 };
   // Where a mark's label sits relative to its last handle, in screen px. Drawing and
   // hit-testing share it so a tap lands on what the eye sees.
   var LABEL_OFFSET = [16, -28];
@@ -273,16 +281,61 @@
     return { major: Math.max(w, h), minor: Math.min(w, h), width: w, height: h };
   }
 
-  /** The label a mark carries, recomputed from its points. "" while it is incomplete. */
-  function describeMark(mark, spacingMm, calibrated) {
+  function isMarkup(mark) {
+    return !!(mark && Object.prototype.hasOwnProperty.call(MARKUP_TYPES, mark.type));
+  }
+
+  /* Manual calibration (Weasis pattern): the user draws a line over something whose real
+   * length they know, and that fixes mm-per-pixel. Isotropic on purpose — one drawn line
+   * cannot separate row spacing from column spacing.
+   */
+  function spacingFromKnownLength(a, b, length, unit) {
+    var px = distancePx(a, b);
+    var mm = Number(length) * (MM_PER_UNIT[unit] || 1.0);
+    if (!(px > 0) || !(mm > 0)) return null;
+    return [mm / px, mm / px];
+  }
+
+  /** How far a->b leans off the horizontal (axis "h") or the vertical ("v"), 0..90. */
+  function tiltFromAxis(a, b, spacingMm, axis) {
+    var t = ((lineTiltDeg(a, b, spacingMm) % 180) + 180) % 180;
+    if (t > 90) t = 180 - t;
+    return axis === "v" ? 90 - t : t;
+  }
+
+  /** Acute angle between two lines' directions, 0..90 — a line's difference from the reference. */
+  function lineDeltaDeg(pts, refPts, spacingMm) {
+    return Math.abs(tiltDifference(
+      lineTiltDeg(refPts[0], refPts[1], spacingMm),
+      lineTiltDeg(pts[0], pts[1], spacingMm)
+    ));
+  }
+
+  /** The label a mark carries, recomputed from its points. "" while it is incomplete.
+   *  `opts.reference` is the mark flagged as the reference line, if any. */
+  function describeMark(mark, spacingMm, calibrated, opts) {
     var pts = (mark && mark.pts) || [];
     var meta = (mark && mark.meta) || {};
     var sp = calibrated === false ? [1.0, 1.0] : spacingMm || [1.0, 1.0];
     var suffix = calibrated === false ? PIXEL_SUFFIX : DISTANCE_SUFFIX;
-    if (mark.type === "text") return meta.text || "";
+    if (mark.type === "text" || mark.type === "note") return meta.text || "";
     if (mark.type === "point") return meta.n === undefined ? "" : String(meta.n);
+    // Markup carries no measurement, so it never draws a label.
+    if (isMarkup(mark)) return "";
     if (pts.length < (POINTS_NEEDED[mark.type] || 0)) return "";
-    if (mark.type === "line") return formatDistance(pts[0], pts[1], sp, calibrated);
+    if (mark.type === "calibrate") return distancePx(pts[0], pts[1]).toFixed(0) + " px";
+    if (mark.type === "line") {
+      var axis = meta.tiltAxis === "v" ? "v" : "h";
+      var parts = [
+        formatDistance(pts[0], pts[1], sp, calibrated),
+        tiltFromAxis(pts[0], pts[1], sp, axis).toFixed(1) + "° from " + (axis === "v" ? "V" : "H"),
+      ];
+      var ref = opts && opts.reference;
+      if (ref && ref.id !== mark.id && (ref.pts || []).length >= 2) {
+        parts.push("Δ vs ref " + lineDeltaDeg(pts, ref.pts, sp).toFixed(1) + "°");
+      }
+      return parts.join(" · ");
+    }
     if (mark.type === "angle") return formatAngle(pts[0], pts[1], pts[2], sp);
     if (mark.type === "cobb") return cobbAngle(pts, sp).toFixed(1) + "° Cobb";
     if (mark.type === "circle") {
@@ -303,6 +356,8 @@
   function hitTest(marks, screenPt, toScreen, radius) {
     var best = null, bestD = radius;
     for (var i = (marks || []).length - 1; i >= 0; i--) {
+      // Markup has no handles: a stroke is erased whole, never dragged point by point.
+      if (isMarkup(marks[i])) continue;
       var pts = marks[i].pts || [];
       for (var j = 0; j < pts.length; j++) {
         var s = toScreen(pts[j]);
@@ -314,6 +369,50 @@
         var dl = Math.hypot(screenPt[0] - l[0] - LABEL_OFFSET[0], screenPt[1] - l[1] - LABEL_OFFSET[1]);
         if (dl < bestD) { bestD = dl; best = { markIndex: i, ptIndex: "label" }; }
       }
+    }
+    return best;
+  }
+
+  function pointSegmentDistance(p, a, b) {
+    var vx = b[0] - a[0], vy = b[1] - a[1];
+    var len2 = vx * vx + vy * vy;
+    var t = len2 > 0 ? ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / len2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    return Math.hypot(p[0] - (a[0] + t * vx), p[1] - (a[1] + t * vy));
+  }
+
+  /* Ramer-Douglas-Peucker: a freehand stroke arrives as one point per pointermove, so it is
+   * thinned to the points that actually carry its shape before it is stored.
+   */
+  function simplifyPolyline(pts, tolerance) {
+    var copy = function (p) { return p.slice(); };
+    if (!pts || pts.length < 3) return (pts || []).map(copy);
+    var keep = new Uint8Array(pts.length);
+    keep[0] = 1;
+    keep[pts.length - 1] = 1;
+    var stack = [[0, pts.length - 1]];
+    while (stack.length) {
+      var seg = stack.pop(), lo = seg[0], hi = seg[1];
+      var far = -1, farD = tolerance;
+      for (var i = lo + 1; i < hi; i++) {
+        var d = pointSegmentDistance(pts[i], pts[lo], pts[hi]);
+        if (d > farD) { farD = d; far = i; }
+      }
+      if (far >= 0) { keep[far] = 1; stack.push([lo, far], [far, hi]); }
+    }
+    var out = [];
+    for (var j = 0; j < pts.length; j++) if (keep[j]) out.push(copy(pts[j]));
+    return out;
+  }
+
+  /** Shortest distance from a point to a polyline — how the eraser decides what it touched. */
+  function polylineDistance(pts, p) {
+    if (!pts || !pts.length) return Infinity;
+    if (pts.length === 1) return Math.hypot(p[0] - pts[0][0], p[1] - pts[0][1]);
+    var best = Infinity;
+    for (var i = 1; i < pts.length; i++) {
+      var d = pointSegmentDistance(p, pts[i - 1], pts[i]);
+      if (d < best) best = d;
     }
     return best;
   }
@@ -965,11 +1064,19 @@
     circleMetrics: circleMetrics,
     ellipseMetrics: ellipseMetrics,
     describeMark: describeMark,
+    isMarkup: isMarkup,
+    spacingFromKnownLength: spacingFromKnownLength,
+    tiltFromAxis: tiltFromAxis,
+    lineDeltaDeg: lineDeltaDeg,
+    simplifyPolyline: simplifyPolyline,
+    polylineDistance: polylineDistance,
     hitTest: hitTest,
     snapAngle: snapAngle,
     setMarkAngle: setMarkAngle,
     setMarkLength: setMarkLength,
     POINTS_NEEDED: POINTS_NEEDED,
+    MARKUP_TYPES: MARKUP_TYPES,
+    MM_PER_UNIT: MM_PER_UNIT,
     LABEL_OFFSET: LABEL_OFFSET,
     downsample: downsample,
     normalize: normalize,

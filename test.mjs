@@ -87,14 +87,15 @@ check("angle_deg degenerate arm = 0", XV.angleDeg([5, 5], [5, 5], [9, 9], [1, 1]
 const sp = [0.125, 0.125];
 const mark = (type, pts, meta) => ({ id: "t", type, pts, meta: meta || {} });
 
+// 3.2: every line label carries its tilt too — 300 px across, 400 px down is 53.1° off horizontal
 check(
-  "describeMark line = 62.5 mm",
-  XV.describeMark(mark("line", [[100, 200], [400, 600]]), sp, true) === `62.5 ${XV.DISTANCE_SUFFIX}`,
+  "describeMark line = 62.5 mm + tilt",
+  XV.describeMark(mark("line", [[100, 200], [400, 600]]), sp, true) === `62.5 ${XV.DISTANCE_SUFFIX} · 53.1° from H`,
   XV.describeMark(mark("line", [[100, 200], [400, 600]]), sp, true)
 );
 check(
   "describeMark line uncalibrated = 500.0 px",
-  XV.describeMark(mark("line", [[100, 200], [400, 600]]), sp, false) === `500.0 ${XV.PIXEL_SUFFIX}`
+  XV.describeMark(mark("line", [[100, 200], [400, 600]]), sp, false) === `500.0 ${XV.PIXEL_SUFFIX} · 53.1° from H`
 );
 check(
   "describeMark angle (end→vertex→end) = 90.0°",
@@ -130,6 +131,83 @@ check(
 check("describeMark point is its number", XV.describeMark(mark("point", [[5, 5]], { n: 3 }), sp, true) === "3");
 check("describeMark text is its text", XV.describeMark(mark("text", [[5, 5]], { text: "ulna" }), sp, true) === "ulna");
 check("describeMark of an unfinished mark is blank", XV.describeMark(mark("angle", [[0, 0], [1, 1]]), sp, true) === "");
+
+// ------------------------------------------------- calibration maths 3.1
+// a 200 px line drawn over something 25 mm long is 0.125 mm/px, isotropic
+const cal = XV.spacingFromKnownLength([0, 0], [200, 0], 25, "mm");
+check("spacingFromKnownLength 25 mm over 200 px = 0.125", near(cal[0], 0.125) && near(cal[1], 0.125), `${cal}`);
+check(
+  "spacingFromKnownLength counts a diagonal line by its true length",
+  near(XV.spacingFromKnownLength([0, 0], [300, 400], 50, "mm")[0], 0.1),
+  `${XV.spacingFromKnownLength([0, 0], [300, 400], 50, "mm")[0]}`
+);
+check("spacingFromKnownLength cm = 10 mm", near(XV.spacingFromKnownLength([0, 0], [100, 0], 1, "cm")[0], 0.1));
+check("spacingFromKnownLength in = 25.4 mm", near(XV.spacingFromKnownLength([0, 0], [254, 0], 1, "in")[0], 0.1));
+check("spacingFromKnownLength refuses a zero-length line", XV.spacingFromKnownLength([5, 5], [5, 5], 10, "mm") === null);
+check("spacingFromKnownLength refuses a zero length", XV.spacingFromKnownLength([0, 0], [10, 0], 0, "mm") === null);
+// a line calibrated at 0.125 mm/px measures 500 px as 62.5 mm
+check(
+  "a calibrated spacing relabels an old mark",
+  XV.describeMark(mark("line", [[100, 200], [400, 600]]), cal, true).startsWith("62.5 "),
+  XV.describeMark(mark("line", [[100, 200], [400, 600]]), cal, true)
+);
+
+// ------------------------------------------------------ tilt + Δ vs ref 3.2
+check("tiltFromAxis horizontal line = 0 from H", near(XV.tiltFromAxis([0, 0], [10, 0], sp, "h"), 0));
+check("tiltFromAxis horizontal line = 90 from V", near(XV.tiltFromAxis([0, 0], [10, 0], sp, "v"), 90));
+check("tiltFromAxis vertical line = 90 from H", near(XV.tiltFromAxis([0, 0], [0, 10], sp, "h"), 90));
+check("tiltFromAxis vertical line = 0 from V", near(XV.tiltFromAxis([0, 0], [0, 10], sp, "v"), 0));
+check("tiltFromAxis 45° stays 45 either way", near(XV.tiltFromAxis([0, 0], [10, 10], sp, "h"), 45) && near(XV.tiltFromAxis([0, 0], [10, 10], sp, "v"), 45));
+check("tiltFromAxis ignores which end is first", near(XV.tiltFromAxis([10, 10], [0, 0], sp, "h"), 45));
+check("tiltFromAxis stays in 0..90 for an upward line", near(XV.tiltFromAxis([0, 100], [100, 0], sp, "h"), 45));
+check(
+  "describeMark line with tiltAxis v reads from V",
+  XV.describeMark(mark("line", [[0, 0], [100, 0]], { tiltAxis: "v" }), sp, true).endsWith("90.0° from V"),
+  XV.describeMark(mark("line", [[0, 0], [100, 0]], { tiltAxis: "v" }), sp, true)
+);
+check("lineDeltaDeg perpendicular = 90", near(XV.lineDeltaDeg([[0, 0], [0, 100]], [[0, 0], [100, 0]], sp), 90));
+check("lineDeltaDeg parallel = 0", near(XV.lineDeltaDeg([[5, 5], [105, 5]], [[0, 0], [100, 0]], sp), 0));
+check("lineDeltaDeg is the acute angle whichever way each line was drawn", near(XV.lineDeltaDeg([[100, 100], [0, 0]], [[0, 0], [100, 0]], sp), 45));
+const refLine = { id: "ref", type: "line", pts: [[0, 0], [100, 0]], meta: { reference: true } };
+const other = { id: "other", type: "line", pts: [[0, 0], [100, 100]], meta: {} };
+check(
+  "a reference line adds Δ vs ref to every other line",
+  XV.describeMark(other, sp, true, { reference: refLine }).endsWith("Δ vs ref 45.0°"),
+  XV.describeMark(other, sp, true, { reference: refLine })
+);
+check(
+  "the reference line does not label a Δ against itself",
+  XV.describeMark(refLine, sp, true, { reference: refLine }).indexOf("Δ") === -1,
+  XV.describeMark(refLine, sp, true, { reference: refLine })
+);
+check(
+  "an angle mark gains no Δ vs ref",
+  XV.describeMark(mark("angle", [[100, 100], [100, 300], [400, 300]]), sp, true, { reference: refLine }) === "90.0°"
+);
+
+// ------------------------------------------------------------- markup 4.1
+check("isMarkup knows ink from a line", XV.isMarkup({ type: "ink" }) && !XV.isMarkup({ type: "line" }));
+check("markup marks carry no measurement label", XV.describeMark(mark("ink", [[0, 0], [5, 5]], { color: "#f00" }), sp, true) === "");
+check("a markup note shows its text", XV.describeMark(mark("note", [[0, 0]], { text: "chip" }), sp, true) === "chip");
+// hit-testing must walk past markup: a stroke's points are not draggable handles
+check("hitTest ignores markup strokes", XV.hitTest([mark("ink", [[0, 0], [10, 0]])], [0, 0], (p) => p, 36) === null);
+// RDP: a straight run collapses to its ends, a real corner survives
+const straight = XV.simplifyPolyline([[0, 0], [1, 0.2], [2, 0], [3, 0.3], [4, 0]], 1.5);
+check("simplifyPolyline drops points inside the tolerance", straight.length === 2, JSON.stringify(straight));
+const corner = XV.simplifyPolyline([[0, 0], [5, 0], [10, 0], [10, 5], [10, 10]], 1.5);
+check("simplifyPolyline keeps a corner", corner.length === 3 && corner[1][0] === 10 && corner[1][1] === 0, JSON.stringify(corner));
+check("simplifyPolyline keeps the ends", straight[0][0] === 0 && straight[1][0] === 4);
+check("simplifyPolyline leaves a 2-point stroke alone", XV.simplifyPolyline([[0, 0], [9, 9]], 1.5).length === 2);
+check("simplifyPolyline copies its points", XV.simplifyPolyline([[0, 0], [9, 9]], 1.5)[0] !== undefined && XV.simplifyPolyline([[0, 0], [9, 9]], 1.5)[0][0] === 0);
+const spike = XV.simplifyPolyline([[0, 0], [50, 10], [100, 0]], 1.5);
+check("simplifyPolyline keeps a bulge bigger than the tolerance", spike.length === 3);
+// polyline distance: the eraser's hit test
+check("polylineDistance on the line is 0", near(XV.polylineDistance([[0, 0], [100, 0]], [50, 0]), 0));
+check("polylineDistance measures perpendicular", near(XV.polylineDistance([[0, 0], [100, 0]], [50, 7]), 7));
+check("polylineDistance clamps past the end", near(XV.polylineDistance([[0, 0], [100, 0]], [103, 4]), 5));
+check("polylineDistance takes the nearest segment", near(XV.polylineDistance([[0, 0], [100, 0], [100, 100]], [97, 50]), 3));
+check("polylineDistance of a single point is the gap to it", near(XV.polylineDistance([[3, 4]], [0, 0]), 5));
+check("polylineDistance of nothing is Infinity", XV.polylineDistance([], [0, 0]) === Infinity);
 
 // ------------------------------------------------------------- hit-testing
 // identity transform, so screen px == image px and the sums are readable
