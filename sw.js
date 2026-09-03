@@ -1,6 +1,6 @@
 /* Service worker: cache-first app shell, so the viewer opens with no network at all.
  * Bump CACHE whenever any shell file changes — the version string is what evicts the old copy. */
-var CACHE = "xray-ipad-v11";
+var CACHE = "xray-ipad-v12";
 
 var SHELL = [
   "./",
@@ -14,8 +14,17 @@ var SHELL = [
   "./apple-touch-icon.png",
 ];
 
-// three.js is only needed by the relief tab, so a failure here must not sink the install.
-var CDN = ["https://cdnjs.cloudflare.com/ajax/libs/three.js/0.170.0/three.module.min.js"];
+/* three.js is only needed by the relief tab and the four Niivue/dcm2niix files only by the CT
+ * tab, so a failure here must not sink the install — they are added with allSettled below.
+ * The .jpeg build of dcm2niix is the one carrying the JPEG/JPEG-2000/JPEG-LS codecs a real
+ * patient disc needs; dcm2niix.jpeg.js loads dcm2niix.jpeg.wasm relative to itself. */
+var CDN = [
+  "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.170.0/three.module.min.js",
+  "https://cdn.jsdelivr.net/npm/@niivue/niivue@0.69.0/dist/niivue.umd.js",
+  "https://cdn.jsdelivr.net/npm/@niivue/dcm2niix@1.3.20260724/dist/worker.jpeg.js",
+  "https://cdn.jsdelivr.net/npm/@niivue/dcm2niix@1.3.20260724/dist/dcm2niix.jpeg.js",
+  "https://cdn.jsdelivr.net/npm/@niivue/dcm2niix@1.3.20260724/dist/dcm2niix.jpeg.wasm",
+];
 
 self.addEventListener("install", function (event) {
   event.waitUntil(

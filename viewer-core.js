@@ -1861,8 +1861,194 @@
     return { series: series, films: films };
   }
 
+  // ------------------------------------------------- CT volume memory guard
+  /* Nobody — not even Apple — publishes a safe volume size for an iPad's WebGL2 3-D texture
+   * (research §7, hypothesis H4), so the CT tab asks the GPU for MAX_3D_TEXTURE_SIZE, asks the
+   * device for navigator.deviceMemory, and shrinks the volume in-plane until all three limits
+   * are met. The maths lives here, away from any GL context, so the thresholds are testable.
+   */
+  var CT_MAX_VOXELS = 512 * 512 * 512;     // 134 M voxels — the plan's own ceiling
+  var CT_MEMORY_SHARE = 0.25;              // at most a quarter of device memory for one volume
+  var CT_DEFAULT_MEMORY_GB = 4;            // Safari does not implement navigator.deviceMemory
+  var CT_MIN_3D_TEXTURE = 256;             // the WebGL2 floor every conformant device must meet
+  var CT_MAX_FACTOR = 4;                   // 4x in-plane already turns 512 columns into 128
+
+  /**
+   * How far a volume must shrink before it can be uploaded.
+   * @param {number[]} dims [columns, rows, slices] of the volume as it stands
+   * @param {number} bytesPerVoxel 2 for the Int16 a CT arrives as
+   * @param {number} max3d gl.getParameter(gl.MAX_3D_TEXTURE_SIZE)
+   * @param {number} deviceMemoryGB navigator.deviceMemory, or 0/undefined when absent
+   * @returns {{ok: boolean, factor: number, reason: string}} factor is the in-plane divisor
+   *   (1 = as-is, 2 = average every 2x2); ok is false when no allowed factor is enough.
+   */
+  function ctBudget(dims, bytesPerVoxel, max3d, deviceMemoryGB) {
+    var nx = Math.max(1, Math.floor(Number(dims && dims[0]) || 1));
+    var ny = Math.max(1, Math.floor(Number(dims && dims[1]) || 1));
+    var nz = Math.max(1, Math.floor(Number(dims && dims[2]) || 1));
+    var bpv = Number(bytesPerVoxel) > 0 ? Number(bytesPerVoxel) : 2;
+    var limit = Number(max3d) > 0 ? Math.floor(Number(max3d)) : CT_MIN_3D_TEXTURE;
+    var memoryGb = Number(deviceMemoryGB) > 0 ? Number(deviceMemoryGB) : CT_DEFAULT_MEMORY_GB;
+    var budgetBytes = memoryGb * 1073741824 * CT_MEMORY_SHARE;
+
+    // Averaging 2x2 inside a slice never removes a slice, so a stack taller than the texture
+    // limit is the one shape this guard cannot rescue.
+    if (nz > limit) {
+      return {
+        ok: false,
+        factor: 1,
+        reason: nz + " slices is past this GPU's 3-D texture limit of " + limit +
+          " — thinning the stack, not the slices, is what that would need",
+      };
+    }
+
+    var firstReason = "";
+    for (var factor = 1; factor <= CT_MAX_FACTOR; factor *= 2) {
+      var cx = Math.max(1, Math.floor(nx / factor));
+      var cy = Math.max(1, Math.floor(ny / factor));
+      var voxels = cx * cy * nz;
+      var bytes = voxels * bpv;
+      var why = "";
+      if (cx > limit || cy > limit) {
+        why = cx + "×" + cy + " is past this GPU's 3-D texture limit of " + limit;
+      } else if (voxels > CT_MAX_VOXELS) {
+        why = Math.round(voxels / 1e6) + " million voxels is past the " +
+          Math.round(CT_MAX_VOXELS / 1e6) + " million this viewer will upload";
+      } else if (bytes > budgetBytes) {
+        why = Math.round(bytes / 1048576) + " MB is more than a quarter of this device's " +
+          memoryGb + " GB";
+      }
+      if (factor === 1) firstReason = why;
+      if (!why) return { ok: true, factor: factor, reason: factor === 1 ? "" : firstReason };
+    }
+    return { ok: false, factor: CT_MAX_FACTOR, reason: firstReason };
+  }
+
+  // ------------------------------------------------------- NIfTI, in memory
+  /* The CT engine's DICOM path hands back a NIfTI file, so the memory guard reads and shrinks
+   * that rather than our own parsed pixels: one decimator then covers both the engine's output
+   * and anything else NIfTI-shaped, and Niivue still computes its own windowing and geometry
+   * from a header that agrees with the voxels.
+   *
+   * ponytail: NIfTI-1 single file (magic "n+1"), little endian, uncompressed, sform present.
+   * Upgrade path: NIfTI-2 (sizeof_hdr 540) and gz — dcm2niix writes neither unless asked.
+   */
+  var NIFTI_HEADER_BYTES = 348;
+  var NIFTI_DATA_OFFSET = 352;              // 348 header + the 4-byte extender
+  var NIFTI_TYPES = {
+    2: { bytes: 1, array: Uint8Array },
+    4: { bytes: 2, array: Int16Array },
+    8: { bytes: 4, array: Int32Array },
+    16: { bytes: 4, array: Float32Array },
+    512: { bytes: 2, array: Uint16Array },
+    768: { bytes: 4, array: Uint32Array },
+  };
+
+  /** @returns {{dims: number[], frames: number, bytesPerVoxel: number, ...}} */
+  function niftiHeader(buffer) {
+    if (!buffer || buffer.byteLength < NIFTI_DATA_OFFSET) {
+      throw DicomLoadError("not a readable NIfTI file (too short)");
+    }
+    var view = new DataView(buffer);
+    if (view.getInt32(0, true) !== NIFTI_HEADER_BYTES) {
+      var big = view.getInt32(0, false) === NIFTI_HEADER_BYTES;
+      throw DicomLoadError(big
+        ? "this NIfTI file is big endian, which this viewer does not read"
+        : "not a readable NIfTI file (bad header length)");
+    }
+    var datatype = view.getInt16(70, true);
+    var spec = NIFTI_TYPES[datatype];
+    if (!spec) throw DicomLoadError("NIfTI datatype " + datatype + " is not supported");
+    var dim = [];
+    for (var i = 0; i < 8; i++) dim.push(view.getInt16(40 + i * 2, true));
+    var pixdim = [];
+    for (var j = 0; j < 8; j++) pixdim.push(view.getFloat32(76 + j * 4, true));
+    return {
+      dims: [Math.max(1, dim[1]), Math.max(1, dim[2]), Math.max(1, dim[3])],
+      frames: dim[0] >= 4 ? Math.max(1, dim[4]) : 1,
+      datatype: datatype,
+      bytesPerVoxel: spec.bytes,
+      pixdim: pixdim,
+      voxOffset: Math.round(view.getFloat32(108, true)) || NIFTI_DATA_OFFSET,
+      sformCode: view.getInt16(254, true),
+      qformCode: view.getInt16(252, true),
+    };
+  }
+
+  /**
+   * Average every factor×factor block inside each slice; the slice count never changes.
+   * @returns {ArrayBuffer} a fresh NIfTI file with dims, pixdim and the sform matrix adjusted.
+   */
+  function decimateNiftiInPlane(buffer, factor) {
+    var f = Math.max(1, Math.floor(factor));
+    if (f === 1) return buffer;
+    var head = niftiHeader(buffer);
+    if (head.sformCode <= 0) {
+      // Without an sform there is only the quaternion, and shifting that by half a voxel is
+      // exactly the silent-orientation-bug class this build is trying to avoid.
+      throw DicomLoadError("this volume has no sform matrix, so it cannot be safely downsampled");
+    }
+    var spec = NIFTI_TYPES[head.datatype];
+    var nx = head.dims[0], ny = head.dims[1], nz = head.dims[2], nt = head.frames;
+    var mx = Math.max(1, Math.floor(nx / f)), my = Math.max(1, Math.floor(ny / f));
+    var voxels = nx * ny * nz * nt;
+    if (head.voxOffset + voxels * spec.bytes > buffer.byteLength) {
+      throw DicomLoadError("this NIfTI file is truncated (" + voxels + " voxels do not fit)");
+    }
+    var src = new spec.array(buffer, head.voxOffset, voxels);
+    var out = new spec.array(mx * my * nz * nt);
+    var integer = head.datatype !== 16;
+
+    for (var t = 0; t < nt; t++) {
+      for (var z = 0; z < nz; z++) {
+        var plane = (t * nz + z) * nx * ny;
+        var dstPlane = (t * nz + z) * mx * my;
+        for (var y = 0; y < my; y++) {
+          for (var x = 0; x < mx; x++) {
+            var sum = 0;
+            for (var dy = 0; dy < f; dy++) {
+              var row = plane + (y * f + dy) * nx + x * f;
+              for (var dx = 0; dx < f; dx++) sum += src[row + dx];
+            }
+            var mean = sum / (f * f);
+            out[dstPlane + y * mx + x] = integer ? Math.round(mean) : mean;
+          }
+        }
+      }
+    }
+
+    var bytes = new ArrayBuffer(NIFTI_DATA_OFFSET + out.length * spec.bytes);
+    new Uint8Array(bytes).set(new Uint8Array(buffer, 0, NIFTI_HEADER_BYTES));
+    new Uint8Array(bytes, NIFTI_DATA_OFFSET).set(
+      new Uint8Array(out.buffer, out.byteOffset, out.length * spec.bytes)
+    );
+    var head2 = new DataView(bytes);
+    head2.setInt16(40 + 1 * 2, mx, true);
+    head2.setInt16(40 + 2 * 2, my, true);
+    head2.setFloat32(76 + 1 * 4, head.pixdim[1] * f, true);
+    head2.setFloat32(76 + 2 * 4, head.pixdim[2] * f, true);
+    head2.setFloat32(108, NIFTI_DATA_OFFSET, true);
+    // New voxel i covers old f*i .. f*i+f-1, whose centre is f*i + (f-1)/2, so each in-plane
+    // column of the sform scales by f and the origin slides by half the block.
+    [280, 296, 312].forEach(function (base) {
+      var a0 = head2.getFloat32(base, true);
+      var a1 = head2.getFloat32(base + 4, true);
+      head2.setFloat32(base, a0 * f, true);
+      head2.setFloat32(base + 4, a1 * f, true);
+      head2.setFloat32(base + 12, head2.getFloat32(base + 12, true) + ((f - 1) / 2) * (a0 + a1), true);
+    });
+    head2.setInt16(252, 0, true);     // drop the quaternion: the sform above is the truth now
+    new Uint8Array(bytes, NIFTI_HEADER_BYTES, 4).fill(0);
+    return bytes;
+  }
+
   root.XV = {
     DicomLoadError: DicomLoadError,
+    ctBudget: ctBudget,
+    niftiHeader: niftiHeader,
+    decimateNiftiInPlane: decimateNiftiInPlane,
+    CT_MAX_VOXELS: CT_MAX_VOXELS,
+    CT_MAX_FACTOR: CT_MAX_FACTOR,
     parseDicom: parseDicom,
     displayWindow: displayWindow,
     zipEntries: zipEntries,

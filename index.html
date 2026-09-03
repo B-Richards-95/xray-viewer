@@ -61,7 +61,10 @@
   #panels { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   .panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   #reliefStage, #ctStage { position: relative; flex: 1 1 auto; min-height: 0; background: #000; overflow: hidden; }
-  #reliefCanvas, #ctCanvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
+  #reliefCanvas, #ctCanvas, #ctGl { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
+  /* The engine canvas hides by going invisible, never by display:none: a WebGL canvas that
+     was laid out at zero size when its context was made stays black in iPad Safari. */
+  .idle { visibility: hidden; }
   #reliefMessage, #ctMessage {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     text-align: center; padding: 24px; color: var(--ink-dim); font-size: 14px; pointer-events: none;
@@ -256,12 +259,17 @@
 <div class="panel hide" id="panelCT">
   <div id="ctStage">
     <canvas id="ctCanvas"></canvas>
+    <!-- The CT engine draws here; #ctCanvas above is the one-slice fallback when it cannot. -->
+    <canvas id="ctGl" class="idle"></canvas>
     <div id="ctMessage">No CT or MR series open yet.</div>
   </div>
   <div id="controls">
     <div class="group">
       <span style="color:var(--ink-dim);font-size:13px">Series</span>
       <select id="ctSeries"></select>
+      <button id="ctRadiological" aria-pressed="false" title="Radiological: the patient's left is on the right of the image, as on a film hung on a light box.">Radiological</button>
+      <button id="ctPrevSlice" aria-label="Previous slice">Slice −</button>
+      <button id="ctNextSlice" aria-label="Next slice">Slice +</button>
     </div>
     <div id="ctStatus"></div>
   </div>
@@ -486,18 +494,22 @@
 
   function openFiles(list) {
     statusBox.textContent = "Reading " + list.length + " file(s)…";
-    storeFiles(list).catch(function (e) { showError("Could not save to this device: " + e.message); });
+    storeFiles(list).catch(function (e) { showError("Could not save to this device: " + String(e && e.message || e)); });
     ingest(list).catch(function (e) { showError(String(e && e.message || e)); });
   }
 
   function ingest(fileObjects) {
     var problems = openProblems;
     openProblems = [];
+    // The CT engine needs the whole series' bytes again later, and re-reading them from
+    // IndexedDB would fail on the one browser (headless WebKit) that refuses to store Blobs.
+    ctFiles = {};
+    Array.prototype.forEach.call(fileObjects, function (f) { ctFiles[f.name] = f; });
     var jobs = Array.prototype.map.call(fileObjects, function (f) {
       return f.arrayBuffer().then(function (buf) {
         // Tolerant: a slice whose pixels need the CT engine still lists under its series.
         try { return XV.parseDicom(buf, f.name, { allowUndecodable: true }); }
-        catch (e) { problems.push(f.name + ": " + e.message); return null; }
+        catch (e) { problems.push(f.name + ": " + String(e && e.message || e)); return null; }
       });
     });
     return Promise.all(jobs).then(function (parsed) {
@@ -1618,28 +1630,368 @@
   el("rotateRight").onclick = function () { rotateBy(Math.PI / 2); };
 
   // -------------------------------------------------------------- CT tab
-  /* Phase 1 of the CT work: the series the files were grouped into, and the middle slice of the
-   * chosen one drawn with that file's own WindowCenter/Width. It exists so the grouping, the
-   * unzipping and the tab are provable before the Niivue engine arrives in Phase 2, which
-   * replaces this canvas. */
+  /* Phase 2: Niivue (pinned 0.69.0) renders the volume; the one-slice canvas from Phase 1 is
+   * kept as the fallback the panel falls back to, by name, when the engine cannot load.
+   *
+   * The DICOM path is dcm2niix compiled to wasm: it reads Implicit VR and JPEG Lossless discs
+   * our own parser refuses, and hands back a NIfTI file. We drive its worker directly rather
+   * than through @niivue/dicom-loader, because that package builds its worker with
+   * `new Worker(new URL("./worker.jpeg.js", import.meta.url))` and a cross-origin worker URL is
+   * a SecurityError in every browser — the shim below makes a same-origin blob worker whose one
+   * line imports the CDN worker as a module, which is allowed. The wire format (a {fileList,
+   * cmd} message in, {convertedFiles, exitCode} out) is the loader's own, copied not invented.
+   * ponytail: if @niivue/dicom-loader ever ships a worker-URL option, delete the shim.
+   */
+  var CT_NIIVUE_URL = "https://cdn.jsdelivr.net/npm/@niivue/niivue@0.69.0/dist/niivue.umd.js";
+  var CT_DCM2NIIX_BASE = "https://cdn.jsdelivr.net/npm/@niivue/dcm2niix@1.3.20260724/dist/";
+  var CT_DCM2NIIX_WORKER = CT_DCM2NIIX_BASE + "worker.jpeg.js";   // .jpeg: the codec-carrying build
+  var CT_LOAD_TIMEOUT_MS = 25000;
+
   var seriesList = [];       // XV.groupSeries output, in the order the files arrived
   var ctIndex = -1;
+  var ctFiles = {};          // file name -> the File the bytes came in on, for the engine
   var ctCanvas = el("ctCanvas"), ctCtx = ctCanvas.getContext("2d");
+  var ctGl = el("ctGl");
   var ctSlice = document.createElement("canvas");
   var ctSliceCtx = ctSlice.getContext("2d");
   var ctSliceReady = false;
 
+  var nv = null;             // the Niivue instance, once it has attached
+  var ctEngine = null;       // the loaded UMD namespace (window.niivue)
+  var ctEnginePromise = null;
+  var ctEngineDead = "";     // why the engine gave up, so the fallback can say so
+  var ctBuiltFor = -1;       // the series index currently uploaded
+  var ctBuildToken = 0;      // a series switch mid-build must not let the old one win
+  var ctBusy = false;
+  var ctRadiological = false;
+  var ctVolumeNote = "";     // what the memory guard did, if anything
+  var ctWhere = null;        // the last onLocationChange payload
+
   function ctMessage(text) { el("ctMessage").textContent = text || ""; }
 
+  /* Nothing about a black panel says why it is black, so every route a failure can take — a
+   * throw anywhere on the page, a rejected promise, a lost WebGL context, a stalled import —
+   * ends up as words here. Same shape as the relief tab's describeError. */
+  function describeCtError(e) {
+    if (!e) return "unknown error";
+    var text = e.message ? String(e.message) : String(e);
+    var lines = String(e.stack || "").split("\n").map(function (s) { return s.trim(); })
+      .filter(Boolean);
+    var frame = null;
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].indexOf(text) === -1) { frame = lines[i]; break; }
+    }
+    if (!frame) frame = lines[0] || "";
+    return frame ? text + "  [" + frame + "]" : text;
+  }
+
+  function ctFail(what, e) {
+    var text = what + ": " + describeCtError(e);
+    ctMessage(text);
+    updateStatus(text);
+    return text;
+  }
+
+  /* The page's own error routes reach this panel too, but only while the CT tab is the one on
+   * screen or a build is running — otherwise a relief-tab failure would overwrite a CT message
+   * nobody is looking at. */
+  function ctPageError(what, e) {
+    if (activeTab !== "ct" && !ctBusy) return;
+    ctFail(what, e);
+  }
+  window.addEventListener("error", function (ev) {
+    ctPageError("Error", ev.error || { message: ev.message + " (" + ev.filename + ":" + ev.lineno + ")" });
+  });
+  window.addEventListener("unhandledrejection", function (ev) {
+    ctPageError("Unhandled rejection", ev.reason);
+  });
+  ctGl.addEventListener("webglcontextlost", function (ev) {
+    ev.preventDefault();
+    ctEngineDead = "the GPU dropped this canvas";
+    ctShowEngine(false);
+    ctFail("WebGL context lost", { message: "the GPU dropped this canvas — reload the page" });
+  });
+
+  // ------------------------------------------------------ loading the engine
+
+  function loadScriptOnce(url) {
+    return new Promise(function (resolve, reject) {
+      var tag = document.createElement("script");
+      var timer = setTimeout(function () {
+        reject(new Error("timed out after " + Math.round(CT_LOAD_TIMEOUT_MS / 1000) + " s"));
+      }, CT_LOAD_TIMEOUT_MS);
+      tag.onload = function () { clearTimeout(timer); resolve(); };
+      tag.onerror = function () { clearTimeout(timer); reject(new Error(url + " could not be downloaded")); };
+      tag.src = url;
+      document.head.appendChild(tag);
+    });
+  }
+
+  function ensureNiivue() {
+    if (ctEnginePromise) return ctEnginePromise;
+    ctEnginePromise = loadScriptOnce(CT_NIIVUE_URL).then(function () {
+      if (!window.niivue || !window.niivue.Niivue) {
+        throw new Error("the CT engine loaded but published nothing");
+      }
+      ctEngine = window.niivue;
+      return ctEngine;
+    });
+    return ctEnginePromise;
+  }
+
+  /* One worker per conversion, torn down after: the wasm filesystem keeps /input and /output
+   * from the previous run, so a second series in the same worker dies on "File exists" — and
+   * throwing the worker away is also what returns a 68-slice study's heap to the iPad. */
+  function startDcm2niix() {
+    return new Promise(function (resolve, reject) {
+      var shim = 'import "' + CT_DCM2NIIX_WORKER + '";';
+      var blobUrl = URL.createObjectURL(new Blob([shim], { type: "text/javascript" }));
+      var worker;
+      try { worker = new Worker(blobUrl, { type: "module" }); }
+      catch (e) { reject(e); return; }
+      var timer = setTimeout(function () {
+        worker.terminate();
+        reject(new Error("the DICOM decoder timed out after " +
+          Math.round(CT_LOAD_TIMEOUT_MS / 1000) + " s"));
+      }, CT_LOAD_TIMEOUT_MS);
+      worker.onerror = function (ev) {
+        clearTimeout(timer);
+        worker.terminate();
+        reject(new Error("the DICOM decoder would not start: " + (ev.message || "unknown error")));
+      };
+      worker.onmessage = function (ev) {
+        if (!ev.data || ev.data.type !== "ready") return;
+        clearTimeout(timer);
+        URL.revokeObjectURL(blobUrl);
+        resolve(worker);
+      };
+    });
+  }
+
+  /** @returns {Promise<File[]>} the .nii files dcm2niix made out of one series. */
+  function convertSeries(files) {
+    return startDcm2niix().then(function (worker) {
+      return new Promise(function (resolve, reject) {
+        var finish = function (fn, value) { worker.terminate(); fn(value); };
+        worker.onerror = function (ev) {
+          finish(reject, new Error("the DICOM decoder stopped: " + (ev.message || "unknown error")));
+        };
+        worker.onmessage = function (ev) {
+          var data = ev.data || {};
+          if (data.type === "ready") return;
+          if (data.type === "error") {
+            finish(reject, new Error(data.message || "the DICOM decoder could not read this series"));
+            return;
+          }
+          // 3 is dcm2niix's "converted, with warnings"; anything else is a real failure.
+          if (data.exitCode === 0 || data.exitCode === 3) finish(resolve, data.convertedFiles || []);
+          else finish(reject, new Error("the DICOM decoder stopped with code " + data.exitCode));
+        };
+        worker.postMessage({
+          fileList: files.map(function (f) { return { file: f, webkitRelativePath: "" }; }),
+          cmd: ["-z", "n", "-b", "n", "-f", "%s_%d"],   // plain .nii, no BIDS sidecar
+        });
+      });
+    });
+  }
+
+  /* dcm2niix writes a second "_Eq_" volume whenever the slice spacing varies, because only the
+   * resampled one is a regular grid a NIfTI (and a 3-D texture) can hold — so that is the one
+   * to show. Otherwise the biggest output is the volume and the rest are derived stubs. */
+  function pickVolumeFile(converted) {
+    var nii = converted.filter(function (f) { return /\.nii$|\.nii\.gz$/.test(f.name); });
+    if (!nii.length) throw new Error("the DICOM decoder produced no volume");
+    var equalised = nii.filter(function (f) { return /_Eq_\d+\.nii/.test(f.name); });
+    var pool = equalised.length ? equalised : nii;
+    return pool.reduce(function (best, f) { return f.size > best.size ? f : best; }, pool[0]);
+  }
+
+  // ---------------------------------------------------------- memory guard
+  /* MAX_3D_TEXTURE_SIZE is the number this whole tab hangs on and nobody publishes it for an
+   * iPad (research §7), so it is read from a throwaway context rather than assumed. */
+  function probeGpu() {
+    var probe = document.createElement("canvas");
+    var gl = probe.getContext("webgl2");
+    if (!gl) return { max3d: 0, renderer: "" };
+    var max3d = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) || 0;
+    var info = gl.getExtension("WEBGL_debug_renderer_info");
+    var renderer = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL) || "") : "";
+    var lose = gl.getExtension("WEBGL_lose_context");
+    if (lose) lose.loseContext();
+    return { max3d: max3d, renderer: renderer };
+  }
+
+  /* ponytail: the volume is shrunk as a NIfTI file, not as an NVImage. Decimating img plus
+   * hdr.dims plus the pixdims plus both geometry matrices after the fact is more places to be
+   * silently wrong than rewriting one header before Niivue ever sees it, and this way Niivue
+   * still derives its own windowing and geometry from a header that agrees with the voxels. */
+  function fitVolumeToDevice(buffer) {
+    var head = XV.niftiHeader(buffer);
+    var gpu = probeGpu();
+    var memory = Number(navigator.deviceMemory) || 0;
+    var budget = XV.ctBudget(head.dims, head.bytesPerVoxel, gpu.max3d, memory);
+    var where = head.dims.join("×") + " at " + head.bytesPerVoxel + " bytes/voxel, " +
+      "GPU limit " + (gpu.max3d || "unknown") +
+      (memory ? ", device memory " + memory + " GB" : ", device memory unreported");
+    if (!budget.ok) throw new Error(budget.reason + " (" + where + ")");
+    if (budget.factor === 1) {
+      ctVolumeNote = "";
+      return buffer;
+    }
+    ctVolumeNote = "shrunk " + budget.factor + "× in-plane — " + budget.reason;
+    return XV.decimateNiftiInPlane(buffer, budget.factor);
+  }
+
+  // ------------------------------------------------------------- rendering
+
+  function ctShowEngine(on) {
+    ctGl.classList.toggle("idle", !on);
+    ctCanvas.classList.toggle("idle", !!on);
+  }
+
+  function ensureNiivueAttached() {
+    if (nv) return Promise.resolve(nv);
+    return ensureNiivue().then(function (NV) {
+      var instance = new NV.Niivue({
+        logLevel: "warn",
+        backColor: [0, 0, 0, 1],
+        isColorbar: false,
+        isOrientCube: true,                                 // the little A/P/L/R cube in 3-D
+        isOrientationTextVisible: true,                     // A/P/L/R/S/I down each 2-D pane
+        isRadiologicalConvention: ctRadiological,
+        sliceType: NV.SLICE_TYPE.MULTIPLANAR,
+        multiplanarLayout: NV.MULTIPLANAR_TYPE.GRID,        // 2×2, not a row or a column
+        multiplanarShowRender: NV.SHOW_RENDER.ALWAYS,       // the 4th tile is the 3-D render
+        multiplanarEqualSize: true,
+        dragAndDropEnabled: false,                          // Open files is the only way in
+        // Niivue owns the touches; these say what its own handlers should do rather than
+        // fighting them. One finger drags the linked crosshair, which is what scrolls the
+        // other two planes; two fingers pan. Pinch is Niivue's own slice scroll (it calls
+        // sliceScroll2D, not a zoom) and is left alone.
+        touchEventConfig: {
+          singleTouch: NV.DRAG_MODE.crosshair,
+          doubleTouch: NV.DRAG_MODE.pan,
+        },
+      });
+      instance.onLocationChange = function (data) {
+        ctWhere = data;
+        updateCtStatus();
+      };
+      return instance.attachToCanvas(ctGl).then(function () {
+        nv = instance;
+        return nv;
+      });
+    });
+  }
+
+  /** The whole engine path for one series: load, decode, guard, upload. */
+  function ctBuildEngine(index) {
+    var series = seriesList[index];
+    if (!series) return Promise.resolve();
+    var token = ++ctBuildToken;
+    var stale = function () { return token !== ctBuildToken; };
+    ctBusy = true;
+    ctMessage("Loading CT engine…");
+    return ensureNiivueAttached().then(function () {
+      if (stale()) return null;
+      ctMessage("Decoding " + series.instances.length +
+        (series.instances.length === 1 ? " slice…" : " slices…"));
+      var files = [];
+      var missing = 0;
+      series.instances.forEach(function (instance) {
+        var file = ctFiles[instance.name];
+        if (file) files.push(file);
+        else missing += 1;
+      });
+      if (!files.length) {
+        throw new Error(missing
+          ? "this series' bytes are no longer in memory — open the files again"
+          : "this series has no files");
+      }
+      return convertSeries(files);
+    }).then(function (converted) {
+      if (!converted || stale()) return null;
+      ctMessage("Building volume…");
+      var chosen = pickVolumeFile(converted);
+      return chosen.arrayBuffer().then(function (buffer) {
+        return { name: chosen.name, buffer: fitVolumeToDevice(buffer) };
+      });
+    }).then(function (volume) {
+      if (!volume || stale()) return null;
+      return ctEngine.NVImage.loadFromFile({
+        file: new File([volume.buffer], volume.name),
+        name: series.label,
+      });
+    }).then(function (image) {
+      if (!image || stale()) return null;
+      nv.volumes.slice().forEach(function (old) { nv.removeVolume(old); });
+      nv.addVolume(image);
+      nv.setSliceType(ctEngine.SLICE_TYPE.MULTIPLANAR);
+      nv.setRadiologicalConvention(ctRadiological);
+      ctBuiltFor = index;
+      ctShowEngine(true);
+      ctMessage("");
+      ctResize();
+      updateCtStatus();
+      ctBusy = false;
+      return image;
+    }).catch(function (e) {
+      ctBusy = false;
+      if (stale()) return null;
+      ctEngineDead = describeCtError(e);
+      ctShowEngine(false);
+      ctFail("The CT engine could not show this series — showing one slice instead", e);
+      updateCtStatus();
+      return null;
+    });
+  }
+
+  function updateCtStatus() {
+    var series = seriesList[ctIndex];
+    if (!series) { el("ctStatus").textContent = ""; return; }
+    var parts = [series.label];
+    if (ctBuiltFor === ctIndex && nv && nv.volumes.length) {
+      // Read the crosshair off the scene rather than waiting for onLocationChange, so the
+      // line is complete the moment the volume lands, not only after the first touch.
+      var volume = nv.volumes[0];
+      var dims = volume.hdr ? volume.hdr.dims : null;
+      var vox = null;
+      try { vox = nv.frac2vox(nv.scene.crosshairPos); } catch (e) { vox = null; }
+      if (vox && dims) {
+        parts.push(dims[1] + "×" + dims[2] + "×" + dims[3] + " voxels");
+        parts.push("slice " + (Math.round(vox[2]) + 1) + " of " + dims[3]);
+        var hu = volume.getValue(Math.round(vox[0]), Math.round(vox[1]), Math.round(vox[2]));
+        if (isFinite(hu)) parts.push(Math.round(hu) + " HU at the crosshair");
+      } else if (dims) {
+        parts.push(dims[1] + "×" + dims[2] + "×" + dims[3] + " voxels");
+      }
+      parts.push(ctRadiological ? "radiological" : "neurological");
+      if (ctVolumeNote) parts.push(ctVolumeNote);
+    } else {
+      var slice = series.instances[series.middle];
+      if (slice && slice.pixels) {
+        var win = slice.dicomWindow;
+        parts.push("slice " + (series.middle + 1) + " of " + series.instances.length);
+        parts.push("window " + Math.round(win.width) + "/" + Math.round(win.center) +
+          (win.fromFile ? " from the file" : " (default soft tissue)"));
+      }
+      parts.push(ctEngineDead ? "one slice only — the CT engine failed" : "one slice — the CT engine is loading");
+    }
+    el("ctStatus").textContent = parts.join(" · ");
+  }
+
+  // ------------------------------------------ the Phase 1 fallback (one slice)
+
   function setSeries(list) {
-    /* ponytail: only the middle slice is drawn, so every other slice's pixels go as soon as the
-     * series is grouped — 300 × 512² Uint16 is 150 MB the iPad has no use for yet. The
-     * bytes stay in IndexedDB, which is where Phase 2's engine will read the volume from. */
+    /* ponytail: only the middle slice is kept as pixels, so every other slice's pixels go as
+     * soon as the series is grouped — 300 × 512² Uint16 is 150 MB the fallback has no use for.
+     * The engine reads the original bytes again from ctFiles, not from here. */
     list.forEach(function (s) {
       s.middle = Math.floor(s.instances.length / 2);
       s.instances.forEach(function (instance, i) { if (i !== s.middle) instance.pixels = null; });
     });
     seriesList = list;
+    ctBuiltFor = -1;
     var picker = el("ctSeries");
     picker.innerHTML = "";
     list.forEach(function (s, i) {
@@ -1653,9 +2005,11 @@
 
   function ctSelect(index) {
     ctIndex = index;
+    ctWhere = null;
+    ctVolumeNote = "";
     if (index >= 0) el("ctSeries").value = String(index);
     renderCtSlice();
-    if (activeTab === "ct") ctResize(); else drawCt();
+    if (activeTab === "ct") ctActivate(); else drawCt();
   }
 
   /** The middle slice, windowed on its own centre and width, into an off-screen canvas. */
@@ -1663,14 +2017,14 @@
     ctSliceReady = false;
     var s = seriesList[ctIndex];
     if (!s) {
+      ctShowEngine(false);
       ctMessage(seriesList.length ? "Pick a series." : "No CT or MR series open yet.");
       el("ctStatus").textContent = "";
       return;
     }
     var slice = s.instances[s.middle];
     if (!slice || !slice.pixels) {
-      ctMessage("compressed — needs the CT engine (Phase 2)");
-      el("ctStatus").textContent = s.label;
+      updateCtStatus();
       return;
     }
     // Same windowing path as the 2-D tab: one table over the 16-bit range, then a lookup.
@@ -1695,11 +2049,7 @@
     ctSliceCtx.putImageData(image, 0, 0);
     ctSliceReady = true;
     ctMessage("");
-    el("ctStatus").textContent =
-      s.label + " · slice " + (s.middle + 1) + " of " + s.instances.length +
-      " · window " + Math.round(win.width) + "/" + Math.round(win.center) +
-      (win.fromFile ? " from the file" : " (default soft tissue)") +
-      " · one slice for now — scrolling and 3-D come with the CT engine";
+    updateCtStatus();
   }
 
   function drawCt() {
@@ -1720,9 +2070,36 @@
     var h = Math.max(1, Math.round(box.height * dpr));
     if (ctCanvas.width !== w || ctCanvas.height !== h) { ctCanvas.width = w; ctCanvas.height = h; }
     drawCt();
+    if (nv && !ctGl.classList.contains("idle")) {
+      nv.resizeListener();
+      nv.drawScene();
+    }
+  }
+
+  /** First arrival on the CT tab with a series chosen is what starts the engine. */
+  function ctActivate() {
+    ctResize();
+    if (ctIndex < 0 || ctEngineDead || ctBusy) return;
+    if (ctBuiltFor === ctIndex) { ctShowEngine(true); ctResize(); return; }
+    ctBuildEngine(ctIndex);
   }
 
   el("ctSeries").onchange = function () { ctSelect(Number(el("ctSeries").value)); };
+  el("ctRadiological").onclick = function () {
+    ctRadiological = !ctRadiological;
+    el("ctRadiological").setAttribute("aria-pressed", String(ctRadiological));
+    el("ctRadiological").textContent = ctRadiological ? "Radiological" : "Neurological";
+    if (nv) nv.setRadiologicalConvention(ctRadiological);
+    updateCtStatus();
+  };
+  // Buttons as well as gestures: iPadOS Safari's gesture strip has eaten taps at the bottom of
+  // this app before, and a slice step has to be reachable without a mouse wheel.
+  function stepSlice(by) {
+    if (!nv || ctBuiltFor !== ctIndex) return;
+    nv.moveCrosshairInVox(0, 0, by);
+  }
+  el("ctPrevSlice").onclick = function () { stepSlice(-1); };
+  el("ctNextSlice").onclick = function () { stepSlice(1); };
 
   // ------------------------------------------------------------- tabs
   // The relief tab lives in a module script (it needs a dynamic import for three.js);
@@ -1738,7 +2115,7 @@
     el("tabRelief").setAttribute("aria-pressed", String(name === "relief"));
     el("tabCT").setAttribute("aria-pressed", String(name === "ct"));
     if (name === "2d") { resize(); requestDraw(); }
-    else if (name === "ct") ctResize();
+    else if (name === "ct") ctActivate();
     else if (window.ReliefTab) window.ReliefTab.activate();
   }
   el("tab2d").onclick = function () { showTab("2d"); };

@@ -631,6 +631,99 @@ check(
   `${r.modality} ${r.seriesInstanceUid}`
 );
 
+// ------------------------------------------------- CT memory guard (Phase 2.2)
+// Nobody publishes an iPad ceiling, so the guard is what decides; these cases pin its edges.
+const fits = XV.ctBudget([512, 512, 68], 2, 2048, 8);
+check(
+  "a 68-slice 512² CT is uploaded as it is",
+  fits.ok === true && fits.factor === 1 && fits.reason === "",
+  JSON.stringify(fits)
+);
+const tall = XV.ctBudget([512, 512, 600], 2, 2048, 8);
+check(
+  "512×512×600 Int16 trips the guard and halves in-plane",
+  tall.ok === true && tall.factor === 2 && tall.reason.includes("million voxels"),
+  JSON.stringify(tall)
+);
+const wide = XV.ctBudget([1024, 1024, 200], 2, 256, 8);
+check(
+  "a volume wider than MAX_3D_TEXTURE_SIZE shrinks until it fits",
+  wide.ok === true && wide.factor === 4 && wide.reason.includes("texture limit of 256"),
+  JSON.stringify(wide)
+);
+const thin = XV.ctBudget([512, 512, 700], 2, 512, 8);
+check(
+  "too many slices is refused, not silently downsampled",
+  thin.ok === false && thin.reason.includes("700 slices"),
+  JSON.stringify(thin)
+);
+const poor = XV.ctBudget([512, 512, 400], 2, 4096, 0.5);
+check(
+  "a small-memory device gets a smaller volume (default 4 GB when unreported)",
+  poor.factor > 1 && poor.reason.includes("0.5 GB"),
+  JSON.stringify(poor)
+);
+
+// ------------------------------------------- NIfTI decimation (Phase 2.2)
+function fakeNifti(nx, ny, nz, fill) {
+  const bytes = new ArrayBuffer(352 + nx * ny * nz * 2);
+  const h = new DataView(bytes);
+  h.setInt32(0, 348, true);
+  h.setInt16(40, 3, true);
+  h.setInt16(42, nx, true);
+  h.setInt16(44, ny, true);
+  h.setInt16(46, nz, true);
+  h.setInt16(70, 4, true);            // DT_INT16
+  h.setInt16(72, 16, true);
+  for (let i = 0; i < 4; i++) h.setFloat32(76 + i * 4, i === 0 ? 1 : 0.5, true);
+  h.setFloat32(108, 352, true);
+  h.setInt16(252, 1, true);           // qform present, so the decimator must drop it
+  h.setInt16(254, 1, true);
+  h.setFloat32(280, 0.5, true); h.setFloat32(292, -10, true);   // srow_x = [0.5,0,0,-10]
+  h.setFloat32(300, 0.5, true); h.setFloat32(308, -20, true);   // srow_y = [0,0.5,0,-20]
+  h.setFloat32(320, 3.0, true); h.setFloat32(324, 5, true);     // srow_z = [0,0,3,5]
+  const img = new Int16Array(bytes, 352, nx * ny * nz);
+  for (let i = 0; i < img.length; i++) img[i] = fill(i);
+  return bytes;
+}
+const niiHead = XV.niftiHeader(fakeNifti(8, 6, 4, () => 7));
+check(
+  "a NIfTI header reads its dims and voxel size",
+  niiHead.dims.join(",") === "8,6,4" && niiHead.bytesPerVoxel === 2 && niiHead.frames === 1,
+  JSON.stringify(niiHead.dims)
+);
+// A ramp along x: averaging 2×2 must give the mean of each pair of columns.
+const ramp = fakeNifti(8, 6, 2, (i) => i % 8);
+const halved = XV.decimateNiftiInPlane(ramp, 2);
+const halvedHead = XV.niftiHeader(halved);
+const halvedImg = new Int16Array(halved, 352, 4 * 3 * 2);
+check(
+  "2× in-plane decimation halves the columns and rows, keeps the slices",
+  halvedHead.dims.join(",") === "4,3,2",
+  JSON.stringify(halvedHead.dims)
+);
+check(
+  "the decimated voxels are the 2×2 means",
+  [0, 1, 2, 3].every((x) => halvedImg[x] === Math.round((2 * x + 2 * x + 1) / 2)),
+  Array.from(halvedImg.slice(0, 4)).join(",")
+);
+check(
+  "pixdim doubles in-plane and the slice thickness is untouched",
+  near(halvedHead.pixdim[1], 1) && near(halvedHead.pixdim[2], 1) && near(halvedHead.pixdim[3], 0.5),
+  halvedHead.pixdim.slice(1, 4).join(",")
+);
+const sm = new DataView(halved);
+check(
+  "the sform scales and slides by half a block, and the quaternion is dropped",
+  near(sm.getFloat32(280, true), 1, 1e-6) && near(sm.getFloat32(292, true), -9.75, 1e-5) &&
+    near(sm.getFloat32(320, true), 3, 1e-6) && halvedHead.qformCode === 0,
+  `${sm.getFloat32(280, true)} ${sm.getFloat32(292, true)} qform=${halvedHead.qformCode}`
+);
+let noSform = "";
+const bare = fakeNifti(8, 6, 2, () => 1);
+new DataView(bare).setInt16(254, 0, true);
+try { XV.decimateNiftiInPlane(bare, 2); } catch (e) { noSform = e.message; }
+check("a volume with no sform is refused rather than mis-oriented", noSform.includes("sform"), noSform);
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
