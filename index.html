@@ -1,12 +1,12 @@
 <meta charset="utf-8">
-<title>X-ray viewer</title>
+<title>Scan viewer</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0b0d10">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="X-ray viewer">
+<meta name="apple-mobile-web-app-title" content="Scan viewer">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="icon" href="icon-192.png" type="image/png">
@@ -60,9 +60,9 @@
   #tabs { display: flex; gap: 6px; margin-left: auto; }
   #panels { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   .panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-  #reliefStage { position: relative; flex: 1 1 auto; min-height: 0; background: #000; overflow: hidden; }
-  #reliefCanvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
-  #reliefMessage {
+  #reliefStage, #ctStage { position: relative; flex: 1 1 auto; min-height: 0; background: #000; overflow: hidden; }
+  #reliefCanvas, #ctCanvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; }
+  #reliefMessage, #ctMessage {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     text-align: center; padding: 24px; color: var(--ink-dim); font-size: 14px; pointer-events: none;
   }
@@ -99,7 +99,7 @@
   .slider label { color: var(--ink-dim); font-size: 13px; white-space: nowrap; }
   input[type=range] { flex: 1 1 auto; min-width: 90px; height: var(--tap); accent-color: var(--accent); }
   .group { display: flex; gap: 6px; align-items: center; }
-  #status { flex: 1 1 100%; color: var(--ink-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
+  #status, #ctStatus { flex: 1 1 100%; color: var(--ink-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
   .hide { display: none !important; }
 
   /* One row of tools: never wraps, scrolls sideways when the screen is too narrow. */
@@ -130,13 +130,17 @@
 </style>
 
 <header>
-  <h1>X-ray viewer</h1>
+  <h1>Scan viewer</h1>
   <button id="open">Open files</button>
   <button id="clear">Clear</button>
-  <input id="file" type="file" multiple accept=".dcm,.dicom,.ima,application/dicom" hidden>
+  <!-- A CT study off a disc has no file extensions at all (I1000000, not I1000000.dcm), so
+       octet-stream keeps those pickable; what is really a DICOM is decided by its bytes. -->
+  <input id="file" type="file" multiple
+         accept=".dcm,.dicom,.ima,.zip,application/dicom,application/zip,application/octet-stream" hidden>
   <div id="tabs">
     <button id="tab2d" aria-pressed="true">2D</button>
     <button id="tabRelief" aria-pressed="false">Relief</button>
+    <button id="tabCT" aria-pressed="false">CT</button>
   </div>
 </header>
 
@@ -246,6 +250,20 @@
       <select id="reliefInvertStrength"></select>
     </div>
     <div id="reliefNote"></div>
+  </div>
+</div>
+
+<div class="panel hide" id="panelCT">
+  <div id="ctStage">
+    <canvas id="ctCanvas"></canvas>
+    <div id="ctMessage">No CT or MR series open yet.</div>
+  </div>
+  <div id="controls">
+    <div class="group">
+      <span style="color:var(--ink-dim);font-size:13px">Series</span>
+      <select id="ctSeries"></select>
+    </div>
+    <div id="ctStatus"></div>
   </div>
 </div>
 </div>
@@ -418,16 +436,80 @@
     errBox.style.display = text ? "block" : "none";
   }
 
+  var ZIP_NAME = /\.zip$/i;
+
+  function isZip(file) {
+    return ZIP_NAME.test(file.name || "") ||
+      file.type === "application/zip" || file.type === "application/x-zip-compressed";
+  }
+
+  /* A CT study reaches the iPad as one zip far more easily than as 300 loose files, so a zip is
+   * unpacked in a worker (DecompressionStream, no library) and only the entries whose bytes say
+   * DICM come back. Anything that could not be inflated is reported, never silently dropped. */
+  var unzipWorker = null, unzipJobs = {}, unzipNextId = 1;
+
+  function unzip(file, problems) {
+    return file.arrayBuffer().then(function (buffer) {
+      return new Promise(function (resolve, reject) {
+        if (!unzipWorker) {
+          unzipWorker = new Worker("unzip-worker.js");
+          unzipWorker.onmessage = function (event) {
+            var job = unzipJobs[event.data.id];
+            if (!job) return;
+            delete unzipJobs[event.data.id];
+            if (event.data.error) job.reject(new Error(event.data.name + ": " + event.data.error));
+            else job.resolve(event.data);
+          };
+          unzipWorker.onerror = function (event) {
+            // A worker that dies takes every job in flight with it: none may be left pending.
+            Object.keys(unzipJobs).forEach(function (id) {
+              var job = unzipJobs[id];
+              delete unzipJobs[id];
+              job.reject(new Error("the unzipper stopped: " + (event.message || "unknown error")));
+            });
+            unzipWorker = null;
+          };
+        }
+        var id = unzipNextId++;
+        unzipJobs[id] = { resolve: resolve, reject: reject };
+        unzipWorker.postMessage({ id: id, name: file.name, buffer: buffer }, [buffer]);
+      });
+    }).then(function (result) {
+      (result.problems || []).forEach(function (line) { problems.push(file.name + " / " + line); });
+      return (result.files || []).map(function (entry) {
+        return new File([entry.buffer], entry.name, { type: "application/dicom" });
+      });
+    });
+  }
+
+  var openProblems = [];     // trouble found before parsing, merged into ingest's own list
+
+  function openFiles(list) {
+    statusBox.textContent = "Reading " + list.length + " file(s)…";
+    storeFiles(list).catch(function (e) { showError("Could not save to this device: " + e.message); });
+    ingest(list).catch(function (e) { showError(String(e && e.message || e)); });
+  }
+
   function ingest(fileObjects) {
-    var problems = [];
+    var problems = openProblems;
+    openProblems = [];
     var jobs = Array.prototype.map.call(fileObjects, function (f) {
       return f.arrayBuffer().then(function (buf) {
-        try { return XV.parseDicom(buf, f.name); }
+        // Tolerant: a slice whose pixels need the CT engine still lists under its series.
+        try { return XV.parseDicom(buf, f.name, { allowUndecodable: true }); }
         catch (e) { problems.push(f.name + ": " + e.message); return null; }
       });
     });
     return Promise.all(jobs).then(function (parsed) {
-      var loaded = parsed.filter(Boolean);
+      var grouped = XV.groupSeries(parsed.filter(Boolean));
+      setSeries(grouped.series);
+      // A single film with no readable pixels is an error like any other; inside a series it is
+      // only a slice the CT engine has to take over, which is what the CT tab already says.
+      var loaded = grouped.films.filter(function (f) {
+        if (f.pixels) return true;
+        problems.push(f.name + ": " + f.undecodable);
+        return false;
+      });
       loaded.sort(function (a, b) { return a.name.localeCompare(b.name); });
       films = XV.applyGenericLabels(loaded);
       levels = films.map(function (f) { return f.windowRange.slice(); });
@@ -1449,18 +1531,33 @@
   // -------------------------------------------------------------- controls
   el("open").onclick = function () { el("file").click(); };
   el("file").onchange = function (ev) {
-    var chosen = ev.target.files;
-    if (!chosen || !chosen.length) return;
+    var chosen = Array.prototype.slice.call(ev.target.files || []);
+    ev.target.value = "";
+    if (!chosen.length) return;
     requestPersistence();
     showError("");
-    statusBox.textContent = "Reading " + chosen.length + " file(s)…";
-    storeFiles(chosen).catch(function (e) { showError("Could not save to this device: " + e.message); });
-    ingest(chosen).catch(function (e) { showError(String(e && e.message || e)); });
-    ev.target.value = "";
+    var zips = chosen.filter(isZip);
+    if (!zips.length) { openFiles(chosen); return; }
+
+    var loose = chosen.filter(function (f) { return !isZip(f); });
+    var problems = [];
+    statusBox.textContent = "Unzipping " + zips.length + " file(s)…";
+    Promise.all(zips.map(function (z) { return unzip(z, problems); })).then(function (batches) {
+      var all = loose;
+      batches.forEach(function (batch) { all = all.concat(batch); });
+      openProblems = problems;
+      if (!all.length) {
+        showError(problems.length ? problems.join("\n") : "No DICOM files inside " + zips[0].name + ".");
+        statusBox.textContent = "";
+        return;
+      }
+      openFiles(all);
+    }).catch(function (e) { showError(String(e && e.message || e)); });
   };
   el("clear").onclick = function () {
     clearTimeout(saveTimer); saveTimer = null; savePending = null;
     films = []; levels = []; marks = []; current = -1;
+    setSeries([]);
     cancelMeasurement();
     syncCalibButtons();
     undoStack = []; redoStack = [];
@@ -1520,6 +1617,113 @@
   el("rotateLeft").onclick = function () { rotateBy(-Math.PI / 2); };
   el("rotateRight").onclick = function () { rotateBy(Math.PI / 2); };
 
+  // -------------------------------------------------------------- CT tab
+  /* Phase 1 of the CT work: the series the files were grouped into, and the middle slice of the
+   * chosen one drawn with that file's own WindowCenter/Width. It exists so the grouping, the
+   * unzipping and the tab are provable before the Niivue engine arrives in Phase 2, which
+   * replaces this canvas. */
+  var seriesList = [];       // XV.groupSeries output, in the order the files arrived
+  var ctIndex = -1;
+  var ctCanvas = el("ctCanvas"), ctCtx = ctCanvas.getContext("2d");
+  var ctSlice = document.createElement("canvas");
+  var ctSliceCtx = ctSlice.getContext("2d");
+  var ctSliceReady = false;
+
+  function ctMessage(text) { el("ctMessage").textContent = text || ""; }
+
+  function setSeries(list) {
+    /* ponytail: only the middle slice is drawn, so every other slice's pixels go as soon as the
+     * series is grouped — 300 × 512² Uint16 is 150 MB the iPad has no use for yet. The
+     * bytes stay in IndexedDB, which is where Phase 2's engine will read the volume from. */
+    list.forEach(function (s) {
+      s.middle = Math.floor(s.instances.length / 2);
+      s.instances.forEach(function (instance, i) { if (i !== s.middle) instance.pixels = null; });
+    });
+    seriesList = list;
+    var picker = el("ctSeries");
+    picker.innerHTML = "";
+    list.forEach(function (s, i) {
+      var option = document.createElement("option");
+      option.value = String(i);
+      option.textContent = s.label;
+      picker.appendChild(option);
+    });
+    ctSelect(list.length ? 0 : -1);
+  }
+
+  function ctSelect(index) {
+    ctIndex = index;
+    if (index >= 0) el("ctSeries").value = String(index);
+    renderCtSlice();
+    if (activeTab === "ct") ctResize(); else drawCt();
+  }
+
+  /** The middle slice, windowed on its own centre and width, into an off-screen canvas. */
+  function renderCtSlice() {
+    ctSliceReady = false;
+    var s = seriesList[ctIndex];
+    if (!s) {
+      ctMessage(seriesList.length ? "Pick a series." : "No CT or MR series open yet.");
+      el("ctStatus").textContent = "";
+      return;
+    }
+    var slice = s.instances[s.middle];
+    if (!slice || !slice.pixels) {
+      ctMessage("compressed — needs the CT engine (Phase 2)");
+      el("ctStatus").textContent = s.label;
+      return;
+    }
+    // Same windowing path as the 2-D tab: one table over the 16-bit range, then a lookup.
+    var win = slice.dicomWindow;
+    var lo = win.range[0], hi = win.range[1];
+    var span = hi - lo;
+    if (span <= 0) span = 1;
+    var lut = XV.blendLut(0);
+    var table = new Uint8Array(65536);
+    for (var v = 0; v < 65536; v++) {
+      var t = ((v - lo) / span) * 255;
+      table[v] = lut[t < 0 ? 0 : t > 255 ? 255 : Math.round(t)];
+    }
+    ctSlice.width = slice.cols;
+    ctSlice.height = slice.rows;
+    var image = ctSliceCtx.createImageData(slice.cols, slice.rows);
+    var out = image.data, px = slice.pixels;
+    for (var i = 0, j = 0; i < px.length; i++, j += 4) {
+      var g = table[px[i]];
+      out[j] = g; out[j + 1] = g; out[j + 2] = g; out[j + 3] = 255;
+    }
+    ctSliceCtx.putImageData(image, 0, 0);
+    ctSliceReady = true;
+    ctMessage("");
+    el("ctStatus").textContent =
+      s.label + " · slice " + (s.middle + 1) + " of " + s.instances.length +
+      " · window " + Math.round(win.width) + "/" + Math.round(win.center) +
+      (win.fromFile ? " from the file" : " (default soft tissue)") +
+      " · one slice for now — scrolling and 3-D come with the CT engine";
+  }
+
+  function drawCt() {
+    var w = ctCanvas.width, h = ctCanvas.height;
+    ctCtx.setTransform(1, 0, 0, 1, 0, 0);
+    ctCtx.fillStyle = "#000";
+    ctCtx.fillRect(0, 0, w, h);
+    if (!ctSliceReady) return;
+    var scale = Math.min(w / ctSlice.width, h / ctSlice.height);
+    var dw = ctSlice.width * scale, dh = ctSlice.height * scale;
+    ctCtx.drawImage(ctSlice, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  }
+
+  function ctResize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var box = el("ctStage").getBoundingClientRect();
+    var w = Math.max(1, Math.round(box.width * dpr));
+    var h = Math.max(1, Math.round(box.height * dpr));
+    if (ctCanvas.width !== w || ctCanvas.height !== h) { ctCanvas.width = w; ctCanvas.height = h; }
+    drawCt();
+  }
+
+  el("ctSeries").onchange = function () { ctSelect(Number(el("ctSeries").value)); };
+
   // ------------------------------------------------------------- tabs
   // The relief tab lives in a module script (it needs a dynamic import for three.js);
   // it registers itself on window.ReliefTab, so everything here stays optional.
@@ -1529,17 +1733,24 @@
     activeTab = name;
     el("panel2d").classList.toggle("hide", name !== "2d");
     el("panelRelief").classList.toggle("hide", name !== "relief");
+    el("panelCT").classList.toggle("hide", name !== "ct");
     el("tab2d").setAttribute("aria-pressed", String(name === "2d"));
     el("tabRelief").setAttribute("aria-pressed", String(name === "relief"));
+    el("tabCT").setAttribute("aria-pressed", String(name === "ct"));
     if (name === "2d") { resize(); requestDraw(); }
+    else if (name === "ct") ctResize();
     else if (window.ReliefTab) window.ReliefTab.activate();
   }
   el("tab2d").onclick = function () { showTab("2d"); };
   el("tabRelief").onclick = function () { showTab("relief"); };
+  el("tabCT").onclick = function () { showTab("ct"); };
 
   // The bridge the relief module reads: current film, and a nudge when the selection changes.
   window.XVApp = {
     film: function () { return current >= 0 ? films[current] : null; },
+    // Phase 2's CT engine reads the grouped series from here.
+    series: function () { return seriesList; },
+    currentSeries: function () { return ctIndex >= 0 ? seriesList[ctIndex] : null; },
     onFilmChange: null,
     // The relief tab logs its failures here too, so a message survives switching tabs.
     status: function (message) { updateStatus(message); },
@@ -1547,9 +1758,11 @@
 
   // Leaving the page must not lose the edit still sitting in the 500 ms save timer.
   window.addEventListener("pagehide", flushSave);
-  window.addEventListener("resize", function () { resize(); if (window.ReliefTab) window.ReliefTab.resize(); });
+  window.addEventListener("resize", function () {
+    resize(); ctResize(); if (window.ReliefTab) window.ReliefTab.resize();
+  });
   window.addEventListener("orientationchange", function () {
-    setTimeout(function () { resize(); if (window.ReliefTab) window.ReliefTab.resize(); }, 200);
+    setTimeout(function () { resize(); ctResize(); if (window.ReliefTab) window.ReliefTab.resize(); }, 200);
   });
 
   // ------------------------------------------------------------------ PWA

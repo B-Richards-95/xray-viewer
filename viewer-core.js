@@ -1417,9 +1417,14 @@
   }
 
   var WANTED = {};
+  WANTED[tagKey(0x0008, 0x0060)] = "modality";
   WANTED[tagKey(0x0008, 0x103e)] = "seriesDescription";
+  WANTED[tagKey(0x0018, 0x0015)] = "bodyPartExamined";
   WANTED[tagKey(0x0018, 0x1164)] = "imagerPixelSpacing";
   WANTED[tagKey(0x0018, 0x5101)] = "viewPosition";
+  WANTED[tagKey(0x0020, 0x000e)] = "seriesInstanceUid";
+  WANTED[tagKey(0x0020, 0x0013)] = "instanceNumber";
+  WANTED[tagKey(0x0020, 0x0032)] = "imagePositionPatient";
   WANTED[tagKey(0x0028, 0x0002)] = "samplesPerPixel";
   WANTED[tagKey(0x0028, 0x0004)] = "photometric";
   WANTED[tagKey(0x0028, 0x0010)] = "rows";
@@ -1428,6 +1433,10 @@
   WANTED[tagKey(0x0028, 0x0100)] = "bitsAllocated";
   WANTED[tagKey(0x0028, 0x0101)] = "bitsStored";
   WANTED[tagKey(0x0028, 0x0103)] = "pixelRepresentation";
+  WANTED[tagKey(0x0028, 0x1050)] = "windowCenterTag";
+  WANTED[tagKey(0x0028, 0x1051)] = "windowWidthTag";
+  WANTED[tagKey(0x0028, 0x1052)] = "rescaleIntercept";
+  WANTED[tagKey(0x0028, 0x1053)] = "rescaleSlope";
   WANTED[tagKey(0x7fe0, 0x0010)] = "pixelData";
 
   var META_WANTED = {};
@@ -1454,8 +1463,13 @@
     return { spacingMm: [1.0, 1.0], spacingSource: SPACING_MISSING };
   }
 
-  /** Port of dicom_io.to_display_grey, including the MONOCHROME1 flip to bright-is-high. */
-  function toDisplayGrey(samples, rows, cols, samplesPerPixel, photometric, bitsStored) {
+  /**
+   * Port of dicom_io.to_display_grey, including the MONOCHROME1 flip to bright-is-high.
+   * @param {object} [transform] filled in with the stored-value -> grey mapping this made
+   *   ({offset, scale, ceiling}), which is what lets a file's own WindowCenter/Width be
+   *   redrawn on the same scale as the pixels.
+   */
+  function toDisplayGrey(samples, rows, cols, samplesPerPixel, photometric, bitsStored, transform) {
     var count = rows * cols;
     var data = new Float32Array(count);
     var i;
@@ -1476,12 +1490,14 @@
       if (data[i] < low) low = data[i];
       if (data[i] > high) high = data[i];
     }
+    var offset = low < 0.0 ? low : 0.0;
+    var scale = 1.0;
     if (low < 0.0) {
       for (i = 0; i < count; i++) data[i] -= low;
       high -= low;
     }
     if (high > 65535.0) {
-      var scale = 65535.0 / high;
+      scale = 65535.0 / high;
       for (i = 0; i < count; i++) data[i] *= scale;
     }
     var grey = new Uint16Array(count);
@@ -1492,20 +1508,93 @@
       if (v > greyMax) greyMax = v;
     }
 
+    var flipCeiling = 0;
     if (String(photometric || "").trim().toUpperCase() === MONOCHROME1) {
       var ceiling = bitsStored > 0 && bitsStored <= 16 ? (1 << bitsStored) - 1 : 0;
       if (greyMax > ceiling) ceiling = greyMax;
       for (i = 0; i < count; i++) grey[i] = ceiling - grey[i];
+      flipCeiling = ceiling;
+    }
+    if (transform) {
+      transform.offset = offset;
+      transform.scale = scale;
+      transform.ceiling = flipCeiling;
     }
     return grey;
+  }
+
+  var DEFAULT_WINDOW_HU = { center: 40.0, width: 400.0 };   // soft tissue, when the file says nothing
+
+  /**
+   * A file's own WindowCenter/Width, moved onto the grey scale to_display_grey just made.
+   * The tags are quoted in rescaled units (Hounsfield on CT), so they go back through
+   * RescaleSlope/Intercept first; without that a CT's centre of 45 HU would land on stored
+   * value 45 instead of 1069 and the slice would draw black.
+   */
+  function displayWindow(centerHu, widthHu, slope, intercept, transform) {
+    var fromFile = isFinite(centerHu) && isFinite(widthHu) && widthHu > 0;
+    var center = fromFile ? centerHu : DEFAULT_WINDOW_HU.center;
+    var width = fromFile ? widthHu : DEFAULT_WINDOW_HU.width;
+    var m = isFinite(slope) && slope !== 0 ? slope : 1.0;
+    var b = isFinite(intercept) ? intercept : 0.0;
+    var offset = transform && isFinite(transform.offset) ? transform.offset : 0.0;
+    var gain = transform && isFinite(transform.scale) && transform.scale > 0 ? transform.scale : 1.0;
+    var greyCenter = ((center - b) / m - offset) * gain;
+    var greyWidth = (width / Math.abs(m)) * gain;
+    if (transform && transform.ceiling) greyCenter = transform.ceiling - greyCenter;
+    var half = greyWidth / 2.0;
+    return { center: greyCenter, width: greyWidth, range: [greyCenter - half, greyCenter + half], fromFile: fromFile };
+  }
+
+  function tagText(view, found, key) {
+    return found[key] ? readAscii(view, found[key].offset, found[key].length) : "";
+  }
+
+  function tagNumbers(view, found, key) {
+    return found[key] ? decimalStrings(tagText(view, found, key)) : [];
+  }
+
+  function tagNumber(view, found, key) {
+    var values = tagNumbers(view, found, key);
+    return values.length ? values[0] : NaN;
+  }
+
+  /** The identity tags every instance carries, whether or not its pixels can be decoded. */
+  function describeInstance(view, found, filename) {
+    var position = tagNumbers(view, found, "imagePositionPatient");
+    var instanceNumber = tagNumber(view, found, "instanceNumber");
+    return {
+      name: filename,
+      seriesDescription: tagText(view, found, "seriesDescription"),
+      viewPosition: tagText(view, found, "viewPosition"),
+      seriesInstanceUid: tagText(view, found, "seriesInstanceUid"),
+      modality: tagText(view, found, "modality").toUpperCase(),
+      bodyPartExamined: tagText(view, found, "bodyPartExamined"),
+      instanceNumber: isFinite(instanceNumber) ? instanceNumber : null,
+      imagePositionPatient: position.length === 3 && position.every(isFinite) ? position : null,
+    };
+  }
+
+  /** An instance whose header read but whose pixels did not: it still knows its series. */
+  function undecodableRecord(view, found, filename, reason) {
+    var record = describeInstance(view, found, filename);
+    record.label = record.seriesDescription || filename;
+    record.rows = found.rows ? view.getUint16(found.rows.offset, true) : 0;
+    record.cols = found.columns ? view.getUint16(found.columns.offset, true) : 0;
+    record.pixels = null;
+    record.undecodable = reason;
+    return record;
   }
 
   /**
    * Turn one file's bytes into a radiograph.
    * @param {ArrayBuffer} buffer raw file contents
    * @param {string} filename used for the view label, exactly as the desktop uses the path stem
+   * @param {object} [options] allowUndecodable: return a header-only record instead of throwing
+   *   when only the *pixels* are unreadable, so a compressed slice still lists with its series.
    */
-  function parseDicom(buffer, filename) {
+  function parseDicom(buffer, filename, options) {
+    var tolerant = !!(options && options.allowUndecodable);
     var view = new DataView(buffer);
     if (buffer.byteLength < 140) throw DicomLoadError("not a readable DICOM file (too short)");
     if (readAscii(view, 128, 4) !== "DICM") {
@@ -1518,15 +1607,6 @@
     var syntax = meta.transferSyntax
       ? readAscii(view, meta.transferSyntax.offset, meta.transferSyntax.length)
       : "";
-    if (syntax !== EXPLICIT_VR_LE) {
-      var name = TRANSFER_SYNTAXES[syntax] || "unknown transfer syntax";
-      throw DicomLoadError(
-        "pixel data could not be decoded (" +
-          name +
-          (syntax ? " " + syntax : "") +
-          "). This viewer reads uncompressed Explicit VR Little Endian only."
-      );
-    }
 
     var metaEnd = 132;
     if (meta.groupLength) {
@@ -1534,14 +1614,32 @@
       metaEnd = meta.groupLength.offset + meta.groupLength.length + groupLength;
     }
 
+    if (syntax !== EXPLICIT_VR_LE) {
+      var name = TRANSFER_SYNTAXES[syntax] || "unknown transfer syntax";
+      var refusal =
+        "pixel data could not be decoded (" +
+        name +
+        (syntax ? " " + syntax : "") +
+        "). This viewer reads uncompressed Explicit VR Little Endian only.";
+      if (!tolerant) throw DicomLoadError(refusal);
+      // Every compressed syntax still writes its header as explicit VR, so which series this
+      // slice belongs to is usually readable even when its pixels are not. Implicit VR and
+      // big endian are not, and then the file name is all the record has.
+      var head = {};
+      try { scanElements(view, metaEnd, buffer.byteLength, WANTED, head, false); }
+      catch (e) { head = {}; }
+      return undecodableRecord(view, head, filename, refusal);
+    }
+
     var found = {};
     scanElements(view, metaEnd, buffer.byteLength, WANTED, found, false);
 
     if (found.encapsulated) {
-      throw DicomLoadError(
+      var encapsulated =
         "pixel data could not be decoded (encapsulated/compressed pixel data). " +
-          "This viewer reads uncompressed Explicit VR Little Endian only."
-      );
+        "This viewer reads uncompressed Explicit VR Little Endian only.";
+      if (!tolerant) throw DicomLoadError(encapsulated);
+      return undecodableRecord(view, found, filename, encapsulated);
     }
     if (!found.pixelData) throw DicomLoadError("pixel data could not be decoded (no PixelData element)");
     if (!found.rows || !found.columns) throw DicomLoadError("not a readable DICOM file (no Rows/Columns)");
@@ -1553,12 +1651,9 @@
     var bitsStored = found.bitsStored ? view.getUint16(found.bitsStored.offset, true) : 0;
     var signed = found.pixelRepresentation ? view.getUint16(found.pixelRepresentation.offset, true) : 0;
     var photometric = found.photometric ? readAscii(view, found.photometric.offset, found.photometric.length) : "";
-    var seriesDescription = found.seriesDescription
-      ? readAscii(view, found.seriesDescription.offset, found.seriesDescription.length)
-      : "";
-    var viewPosition = found.viewPosition
-      ? readAscii(view, found.viewPosition.offset, found.viewPosition.length)
-      : "";
+    var instance = describeInstance(view, found, filename);
+    var seriesDescription = instance.seriesDescription;
+    var viewPosition = instance.viewPosition;
 
     var expected = rows * cols * samplesPerPixel;
     var samples;
@@ -1581,8 +1676,16 @@
       throw DicomLoadError("pixel data could not be decoded (BitsAllocated " + bitsAllocated + ")");
     }
 
-    var pixels = toDisplayGrey(samples, rows, cols, samplesPerPixel, photometric, bitsStored);
+    var transform = {};
+    var pixels = toDisplayGrey(samples, rows, cols, samplesPerPixel, photometric, bitsStored, transform);
     var window = percentileWindow(pixels, rows, cols);
+    var dicomWindow = displayWindow(
+      tagNumber(view, found, "windowCenterTag"),
+      tagNumber(view, found, "windowWidthTag"),
+      tagNumber(view, found, "rescaleSlope"),
+      tagNumber(view, found, "rescaleIntercept"),
+      transform
+    );
     var spacing = chooseSpacing(
       found.pixelSpacing ? decimalStrings(readAscii(view, found.pixelSpacing.offset, found.pixelSpacing.length)) : null,
       found.imagerPixelSpacing
@@ -1607,12 +1710,168 @@
       viewPosition: viewPosition,
       photometric: photometric,
       bitsStored: bitsStored,
+      seriesInstanceUid: instance.seriesInstanceUid,
+      modality: instance.modality,
+      bodyPartExamined: instance.bodyPartExamined,
+      instanceNumber: instance.instanceNumber,
+      imagePositionPatient: instance.imagePositionPatient,
+      dicomWindow: dicomWindow,
+      undecodable: null,
     };
+  }
+
+  // ------------------------------------------------------------ zip reading
+  /* The directory of a zip, so a whole DICOM folder can arrive as one file from the iPad's
+   * Files app. Only the directory is read here; the bytes are inflated by the caller
+   * (unzip-worker.js uses DecompressionStream, the tests use node's zlib).
+   *
+   * ponytail: no ZIP64, no encryption, no multi-disk. A CT study is thousands of files at
+   * most and well under 4 GB, and a ZIP64 archive is refused by name rather than mis-read.
+   * Upgrade path: read the ZIP64 end-of-directory locator at end-20. */
+  var ZIP_END_OF_DIRECTORY = 0x06054b50;
+  var ZIP_DIRECTORY_ENTRY = 0x02014b50;
+  var ZIP_LOCAL_HEADER = 0x04034b50;
+  var ZIP_STORED = 0, ZIP_DEFLATED = 8;
+  var ZIP_MAX_COMMENT = 65557;      // 64 KB comment plus the 22-byte record itself
+
+  function readUtf8(view, offset, length) {
+    var bytes = new Uint8Array(view.buffer, view.byteOffset + offset, length);
+    if (typeof TextDecoder !== "undefined") return new TextDecoder().decode(bytes);
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return s;
+  }
+
+  /** @returns {Array} one {name, method, compressedSize, uncompressedSize, dataOffset} per entry. */
+  function zipEntries(buffer) {
+    var view = new DataView(buffer);
+    var floor = Math.max(0, buffer.byteLength - ZIP_MAX_COMMENT);
+    var end = -1;
+    for (var i = buffer.byteLength - 22; i >= floor; i--) {
+      if (view.getUint32(i, true) === ZIP_END_OF_DIRECTORY) { end = i; break; }
+    }
+    if (end < 0) throw DicomLoadError("not a readable zip (no end-of-directory record)");
+    var count = view.getUint16(end + 10, true);
+    var directory = view.getUint32(end + 16, true);
+    if (count === 0xffff || directory === 0xffffffff) {
+      throw DicomLoadError("this zip is ZIP64 — unzip it on the computer and pick the .dcm files instead");
+    }
+    var entries = [];
+    var p = directory;
+    for (var n = 0; n < count; n++) {
+      if (p + 46 > buffer.byteLength || view.getUint32(p, true) !== ZIP_DIRECTORY_ENTRY) {
+        throw DicomLoadError("not a readable zip (directory entry " + n + " of " + count + ")");
+      }
+      var method = view.getUint16(p + 10, true);
+      var compressedSize = view.getUint32(p + 20, true);
+      var uncompressedSize = view.getUint32(p + 24, true);
+      var nameLength = view.getUint16(p + 28, true);
+      var extraLength = view.getUint16(p + 30, true);
+      var commentLength = view.getUint16(p + 32, true);
+      var local = view.getUint32(p + 42, true);
+      var name = readUtf8(view, p + 46, nameLength);
+      p += 46 + nameLength + extraLength + commentLength;
+      // The local header repeats the name and carries its own extra field, so where the bytes
+      // actually start can only be worked out there, never from the directory record.
+      if (local + 30 > buffer.byteLength || view.getUint32(local, true) !== ZIP_LOCAL_HEADER) continue;
+      var dataOffset = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
+      entries.push({
+        name: name,
+        method: method,
+        compressedSize: compressedSize,
+        uncompressedSize: uncompressedSize,
+        dataOffset: dataOffset,
+      });
+    }
+    return entries;
+  }
+
+  /** Directory records, resource forks and dotfiles: never image data. */
+  function zipEntryIsJunk(name) {
+    var parts = String(name).split("/");
+    if (parts[parts.length - 1] === "") return true;
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === "__MACOSX" || parts[i].charAt(0) === ".") return true;
+    }
+    return false;
+  }
+
+  /** The DICM marker, which is the only reliable way to tell a .dcm with no extension. */
+  function looksLikeDicom(bytes) {
+    if (!bytes || bytes.length < 132) return false;
+    return bytes[128] === 0x44 && bytes[129] === 0x49 && bytes[130] === 0x43 && bytes[131] === 0x4d;
+  }
+
+  // -------------------------------------------------------- series grouping
+
+  var SERIES_MODALITIES = { CT: 1, MR: 1 };
+
+  /** Slice order: InstanceNumber when the file gives one, else the through-plane position. */
+  function compareInstances(a, b) {
+    var an = a.instanceNumber, bn = b.instanceNumber;
+    if (an !== null && an !== undefined && bn !== null && bn !== undefined && an !== bn) return an - bn;
+    var az = a.imagePositionPatient ? a.imagePositionPatient[2] : null;
+    var bz = b.imagePositionPatient ? b.imagePositionPatient[2] : null;
+    if (az !== null && bz !== null && az !== bz) return az - bz;
+    return String(a.name).localeCompare(String(b.name));
+  }
+
+  function seriesLabel(first, count) {
+    var name = first.seriesDescription || first.bodyPartExamined || first.modality || "Series";
+    return name + " — " + count + (count === 1 ? " image" : " images");
+  }
+
+  /**
+   * Split parsed files into series (the CT tab) and single films (the 2-D tab).
+   * A SeriesInstanceUID group is a series when it holds two or more instances, or when it is
+   * CT/MR at all — a one-slice CT scout still belongs with the scan, not with the x-rays.
+   */
+  function groupSeries(parsed) {
+    var order = [], groups = {};
+    (parsed || []).forEach(function (item) {
+      if (!item) return;
+      var uid = item.seriesInstanceUid || "";
+      // No UID means nothing can be grouped safely, so each such file stands alone.
+      var key = uid ? "uid:" + uid : "file:" + item.name;
+      if (!groups[key]) { groups[key] = { uid: uid, instances: [] }; order.push(key); }
+      groups[key].instances.push(item);
+    });
+
+    var series = [], films = [];
+    order.forEach(function (key) {
+      var group = groups[key];
+      var first = group.instances[0];
+      var modality = String(first.modality || "").toUpperCase();
+      var isSeries = group.instances.length >= 2 ||
+        Object.prototype.hasOwnProperty.call(SERIES_MODALITIES, modality);
+      if (!isSeries) {
+        films = films.concat(group.instances);
+        return;
+      }
+      group.instances.sort(compareInstances);
+      series.push({
+        uid: group.uid,
+        modality: modality,
+        description: first.seriesDescription || "",
+        bodyPart: first.bodyPartExamined || "",
+        label: seriesLabel(first, group.instances.length),
+        instances: group.instances,
+      });
+    });
+    return { series: series, films: films };
   }
 
   root.XV = {
     DicomLoadError: DicomLoadError,
     parseDicom: parseDicom,
+    displayWindow: displayWindow,
+    zipEntries: zipEntries,
+    zipEntryIsJunk: zipEntryIsJunk,
+    looksLikeDicom: looksLikeDicom,
+    groupSeries: groupSeries,
+    ZIP_STORED: ZIP_STORED,
+    ZIP_DEFLATED: ZIP_DEFLATED,
+    DEFAULT_WINDOW_HU: DEFAULT_WINDOW_HU,
     toDisplayGrey: toDisplayGrey,
     identifyView: identifyView,
     applyGenericLabels: applyGenericLabels,

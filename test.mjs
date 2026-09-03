@@ -3,6 +3,7 @@
 // hand from src/xray_viewer/measure.py, and — for the relief steps — against numbers printed by
 // src/xray_viewer/view3d_relief.py itself.
 import { readFileSync } from "node:fs";
+import { crc32, deflateRawSync, inflateRawSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -440,8 +441,9 @@ check("invert_lut(1) flips the ramp", inv[0] === 255 && inv[255] === 0);
 
 // -------------------------------------------------- compressed file rejected
 let threw = "";
+let fake;                 // the tolerant parse below reads it again
 try {
-  const fake = new Uint8Array(400);
+  fake = new Uint8Array(400);
   fake.set([68, 73, 67, 77], 128); // "DICM"
   // (0002,0000) UL 4  groupLength
   const dv = new DataView(fake.buffer);
@@ -459,6 +461,176 @@ try {
   threw = e.message;
 }
 check("compressed transfer syntax gives a clear error", threw.includes("JPEG 2000 Lossless"), threw);
+
+// ------------------------------------------------------------------- zips
+// A CT study arrives as one zip from the iPad's Files app; XV.zipEntries reads the central
+// directory and the browser (node here) does the inflating. The zip is built right here so the
+// test owns every byte of it.
+function zipBlob(files) {
+  const locals = [], directory = [];
+  let offset = 0;
+  for (const file of files) {
+    const body = file.deflate ? deflateRawSync(Buffer.from(file.bytes)) : Buffer.from(file.bytes);
+    const name = Buffer.from(file.name, "utf8");
+    const extra = Buffer.alloc(file.localExtra || 0);
+    const crc = crc32(Buffer.from(file.bytes));
+    const local = Buffer.alloc(30 + name.length + extra.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(file.deflate ? 8 : 0, 8);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(body.length, 18);
+    local.writeUInt32LE(file.bytes.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(extra.length, 28);
+    name.copy(local, 30);
+    extra.copy(local, 30 + name.length);
+
+    const entry = Buffer.alloc(46 + name.length);
+    entry.writeUInt32LE(0x02014b50, 0);
+    entry.writeUInt16LE(20, 4);
+    entry.writeUInt16LE(20, 6);
+    entry.writeUInt16LE(file.deflate ? 8 : 0, 10);
+    entry.writeUInt32LE(crc, 16);
+    entry.writeUInt32LE(body.length, 20);
+    entry.writeUInt32LE(file.bytes.length, 24);
+    entry.writeUInt16LE(name.length, 28);
+    entry.writeUInt32LE(offset, 42);
+    name.copy(entry, 46);
+
+    locals.push(local, body);
+    directory.push(entry);
+    offset += local.length + body.length;
+  }
+  const centre = Buffer.concat(directory);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centre.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, centre, end]);
+}
+
+function dicomish(fill) {
+  const bytes = new Uint8Array(200);
+  bytes.fill(fill);
+  bytes.set([68, 73, 67, 77], 128);   // "DICM" at byte 128
+  return bytes;
+}
+
+const zip = zipBlob([
+  { name: "study/I0001", bytes: dicomish(7), deflate: true, localExtra: 9 },  // extra field: local header only
+  { name: "study/notes.txt", bytes: new TextEncoder().encode("not a scan"), deflate: false },
+  { name: "__MACOSX/._I0001", bytes: new Uint8Array([1, 2, 3]), deflate: false },
+  { name: "study/", bytes: new Uint8Array(0), deflate: false },
+]);
+const zipBuffer = zip.buffer.slice(zip.byteOffset, zip.byteOffset + zip.byteLength);
+const zipped = XV.zipEntries(zipBuffer);
+check("zip directory lists every entry", zipped.length === 4, zipped.map((e) => e.name).join(", "));
+check(
+  "zip entry keeps its method and sizes",
+  zipped[0].method === XV.ZIP_DEFLATED && zipped[0].uncompressedSize === 200 &&
+    zipped[1].method === XV.ZIP_STORED,
+  `${zipped[0].method}/${zipped[0].uncompressedSize}, ${zipped[1].method}`
+);
+const inflated = new Uint8Array(inflateRawSync(
+  Buffer.from(zipBuffer, zipped[0].dataOffset, zipped[0].compressedSize)
+));
+check(
+  "data offset clears the local header's own extra field",
+  inflated.length === 200 && XV.looksLikeDicom(inflated),
+  `${inflated.length} bytes, DICM=${XV.looksLikeDicom(inflated)}`
+);
+const stored = new Uint8Array(zipBuffer, zipped[1].dataOffset, zipped[1].compressedSize);
+check("stored entry reads straight through", new TextDecoder().decode(stored) === "not a scan");
+check("a text file is not mistaken for DICOM", XV.looksLikeDicom(stored) === false);
+check(
+  "resource forks, dotfiles and directory records are junk",
+  !XV.zipEntryIsJunk("study/I0001") && XV.zipEntryIsJunk("__MACOSX/._I0001") &&
+    XV.zipEntryIsJunk("study/")
+);
+let zipRefused = "";
+try { XV.zipEntries(new Uint8Array(500).buffer); } catch (e) { zipRefused = e.message; }
+check("a file that is not a zip is refused by name", zipRefused.includes("end-of-directory"), zipRefused);
+
+// -------------------------------------------------------- series grouping
+function instance(name, uid, modality, extra) {
+  return Object.assign({
+    name, seriesInstanceUid: uid, modality,
+    seriesDescription: "", bodyPartExamined: "", instanceNumber: null, imagePositionPatient: null,
+    pixels: new Uint16Array(4),
+  }, extra || {});
+}
+
+const grouped = XV.groupSeries([
+  instance("c", "1.2.3", "CT", { instanceNumber: 3, seriesDescription: "Abdomen 3.0" }),
+  instance("a", "1.2.3", "CT", { instanceNumber: 1 }),
+  instance("b", "1.2.3", "CT", { instanceNumber: 2 }),
+  instance("scout", "1.2.9", "CT", { bodyPartExamined: "ABDOMEN" }),
+  instance("elbow_ap.dcm", "9.9.9", "DX"),
+  instance("no_uid.dcm", "", ""),
+]);
+check("a multi-slice group becomes a series", grouped.series.length === 2, grouped.series.map((s) => s.label).join(" | "));
+check("a single DX film stays on the 2-D tab", grouped.films.length === 2, grouped.films.map((f) => f.name).join(", "));
+check(
+  "a one-slice CT scout is still a series",
+  grouped.series[1].instances.length === 1 && grouped.series[1].modality === "CT",
+  grouped.series[1].label
+);
+check(
+  "slices sort by InstanceNumber",
+  grouped.series[0].instances.map((i) => i.name).join("") === "abc",
+  grouped.series[0].instances.map((i) => i.name).join("")
+);
+check(
+  "the series label names the study and counts it",
+  grouped.series[0].label === "Abdomen 3.0 \u2014 3 images" && grouped.series[1].label === "ABDOMEN \u2014 1 image",
+  `${grouped.series[0].label} | ${grouped.series[1].label}`
+);
+const byPosition = XV.groupSeries([
+  instance("top", "5.5", "MR", { imagePositionPatient: [0, 0, 9] }),
+  instance("bottom", "5.5", "MR", { imagePositionPatient: [0, 0, -4] }),
+]);
+check(
+  "no InstanceNumber falls back to the slice position",
+  byPosition.series[0].instances.map((i) => i.name).join(",") === "bottom,top",
+  byPosition.series[0].instances.map((i) => i.name).join(",")
+);
+
+// -------------------------------------------------- the file's own window
+// WindowCenter is quoted in Hounsfield units while the pixels are stored values: 45 HU with a
+// -1024 intercept is stored value 1069, and drawing 45 instead would be a black slice.
+const ctWindow = XV.displayWindow(45, 315, 1, -1024, { offset: 0, scale: 1, ceiling: 0 });
+check(
+  "a CT window goes back through the rescale",
+  near(ctWindow.center, 1069) && near(ctWindow.width, 315) && ctWindow.fromFile === true,
+  `C=${ctWindow.center} W=${ctWindow.width}`
+);
+const shifted = XV.displayWindow(NaN, NaN, 1, -1024, { offset: -200, scale: 0.5, ceiling: 0 });
+check(
+  "no window tags falls back to soft tissue, on the shifted grey scale",
+  near(shifted.center, (40 + 1024 + 200) * 0.5) && near(shifted.width, 200) && shifted.fromFile === false,
+  `C=${shifted.center} W=${shifted.width}`
+);
+
+// ------------------------------- a slice whose pixels cannot be read, kept anyway
+const tolerated = XV.parseDicom(fake.buffer, "compressed.dcm", { allowUndecodable: true });
+check(
+  "allowUndecodable keeps the file instead of throwing",
+  tolerated.pixels === null && tolerated.undecodable.includes("JPEG 2000 Lossless"),
+  tolerated.undecodable
+);
+const withStub = XV.groupSeries([tolerated]);
+check("an unreadable file is still listed", withStub.films.length === 1 && withStub.series.length === 0);
+
+// the real film carries the identity tags the CT tab groups on
+check(
+  "the real film reports its series UID and modality",
+  typeof r.seriesInstanceUid === "string" && r.seriesInstanceUid.length > 0 && r.modality.length > 0,
+  `${r.modality} ${r.seriesInstanceUid}`
+);
+
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
