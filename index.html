@@ -1551,6 +1551,13 @@
         /* file:// or a browser with SW off — the viewer still works, just not offline */
       });
     });
+    // A new worker takes over (skipWaiting + claim) while the OLD page is still showing;
+    // reload once so the shell on screen matches the shell in the cache.
+    var hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener("controllerchange", function () {
+      if (hadController) location.reload();
+      hadController = true;
+    });
   }
 
   // The hint is only true advice on iOS Safari: no other browser there can install to the
@@ -1861,12 +1868,18 @@ canvas.addEventListener("wheel", (ev) => {
 
 async function ensureThree() {
   if (THREE) return true;
+  setMessage("Loading the 3D library…");
   try {
-    THREE = await import(THREE_URL);
+    // A stalled download used to leave the panel silent; 25 s is longer than any LTE fetch.
+    THREE = await Promise.race([
+      import(THREE_URL),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out after 25 s")), 25000)),
+    ]);
   } catch (e) {
-    setMessage("The 3D library could not be loaded. Connect to the internet once so it can be cached for offline use.");
+    setMessage("The 3D library could not be loaded (" + describeError(e) + "). Connect to the internet once so it can be cached for offline use.");
     return false;
   }
+  setMessage("Starting the 3D renderer…");
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   scene = new THREE.Scene();
@@ -1909,7 +1922,12 @@ function resize() {
 async function build() {
   const film = window.XVApp && window.XVApp.film();
   if (!film) { setMessage("Open an X-ray first."); return; }
-  if (!(await ensureThree())) return;
+  try {
+    if (!(await ensureThree())) return;
+  } catch (e) {
+    setMessage("The 3D renderer could not start: " + describeError(e));
+    return;
+  }
 
   setMessage("Building relief…");
   await new Promise((r) => setTimeout(r, 30));   // let the message paint before the blocking work
