@@ -1965,7 +1965,17 @@ async function retexture() {
   needsRender = true;
 }
 
-el("reliefBuild").onclick = build;
+// Blake's iPad swallowed the click on this button (2026-09-02) while the emulator did not,
+// so the touch itself starts the build and says so on the panel; click is only a fallback.
+let lastBuildTap = 0;
+function tapBuild(ev) {
+  if (Date.now() - lastBuildTap < 700) return;   // pointerup and click both arrive for one tap
+  lastBuildTap = Date.now();
+  setMessage("Build tapped (" + ev.type + ", " + (ev.pointerType || "click") + ")…");
+  build();
+}
+el("reliefBuild").addEventListener("pointerup", tapBuild);
+el("reliefBuild").addEventListener("click", tapBuild);
 el("reliefHome").onclick = goHome;
 el("reliefInvert").onclick = () => {
   invertOn = !invertOn;
