@@ -1,6 +1,6 @@
 {
-  "name": "Scan viewer",
-  "short_name": "Scan viewer",
+  "name": "X-ray viewer",
+  "short_name": "X-ray viewer",
   "description": "Offline DICOM viewer for my own scans: X-ray windowing, measurements, an intensity relief and CT series.",
   "start_url": "./",
   "scope": "./",

@@ -1,6 +1,5 @@
-# Scan viewer (iPad)
+# X-ray viewer (iPad)
 
-Formerly “X-ray viewer” — the repo and the URL keep the old name.
 
 Offline web viewer for my own scans: 2D windowing, measuring, markup on X-rays, plus an
 intensity relief with **Smooth**, **Detail** and **Rounding** presets and an **Auto** button that
