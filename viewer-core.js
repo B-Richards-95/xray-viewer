@@ -11,7 +11,10 @@
  *   src/xray_viewer/measure.py        distance/angle formulas and their suffix strings
  *   src/xray_viewer/view2d.py         window_bounds, levels<->window, blend_lut
  *   src/xray_viewer/view3d_relief.py  downsample, normalize, gaussian_blur, crop_to_content,
- *                                     clip_percentiles, RELIEF_HEIGHT, SMOOTH_PRESETS, HOME_*
+ *                                     clip_percentiles, unsharp_mask, otsu_threshold,
+ *                                     silhouette_mask, distance_transform, grey_close, dome_field,
+ *                                     closing_lift, round_height, filled_texture, relief_mesh,
+ *                                     relief_statistics, auto_presets, RELIEF_HEIGHT, the presets
  */
 (function (root) {
   "use strict";
@@ -57,6 +60,43 @@
   var CLIP_PERCENTILES = [2.0, 98.0];
   var SMOOTH_PRESETS = [["Off", 0], ["Low", 1], ["Med", 2], ["High", 4]];
   var SMOOTH_DEFAULT = 2;
+  var DETAIL_PRESETS = [["Off", 0], ["Low", 15], ["Med", 30], ["High", 60]];
+  var DETAIL_DEFAULT = 30;
+  var DETAIL_SIGMA_FACTOR = 2.0;
+  var DETAIL_SIGMA_MIN = 1.0;
+  var ROUNDING_PRESETS = [["Off", 0], ["Low", 40], ["Med", 75], ["High", 100]];
+  var ROUNDING_DEFAULT = 75;
+  var DOME_TARGET = 512;
+  var DOME_MAX_DISTANCE = 96;
+  var MASK_MIN_FRACTION = 0.02;
+  var LIMB_DOME_WEIGHT = 0.5;
+  var BONE_CLOSE_FRACTION = 0.25;
+  var DOME_BLUR_SIGMA = 2.0;
+  var DOME_SUPPORT_FEATHER = 1.5;
+  var CLOSE_RADIUS = 14;
+  var CLOSE_MAX_LIFT = 0.18;
+  var CLOSE_FEATHER_SIGMA = 3.0;
+  var CANAL_EPS = 0.01;
+  var TEXTURE_BLUR_SIGMA = 2.0;
+  var TEXTURE_CLOSE_RADIUS = 20;
+  var TEXTURE_MAX_LIFT = 0.20;
+  var TEXTURE_FEATHER_SIGMA = 2.5;
+  var MAD_TO_SIGMA = 1.4826;
+  var AUTO_TARGET = 256;
+  var AUTO_NOISE_SIGMA = 1.0;
+  var AUTO_EDGE_SIGMA = 2.0;
+  // Band edges for the grain measurement, and the smoothing each band asks for.
+  var AUTO_NOISE_EDGES = [0.0008, 0.0016, 0.0055];
+  var AUTO_SMOOTH_CHOICES = [0, 1, 2, 4];
+  // Band edges on *negated* edge energy: a crisp film lands left, a soft one right.
+  var AUTO_EDGE_EDGES = [-0.055, -0.036, -0.020];
+  var AUTO_DETAIL_CHOICES = [0, 15, 30, 60];
+  var AUTO_NOISY_DETAIL_CAP = 15;
+  var AUTO_CANAL_EDGES = [0.006, 0.014, 0.032];
+  var AUTO_ROUNDING_CHOICES = [0, 40, 75, 100];
+  var AUTO_THIN_LIMB = 0.12;
+  var AUTO_THIN_ROUNDING_CAP = 40;
+  var AUTO_TOOLTIP = "Pick Smooth, Detail and Rounding from this film's own grain, edges and canal depth";
   var INVERT_PRESETS = [["Full", 100], ["Half", 50], ["Subtle", 25]];
   var INVERT_DEFAULT = 100;
   var LUT_SIZE = 256;
@@ -502,7 +542,13 @@
   }
 
   function gaussianKernel(sigma) {
-    var radius = Math.max(1, Math.round(3.0 * sigma));
+    // Python's round() breaks a .5 tie to the even number and Math.round breaks it upward, so at
+    // sigma 1.5 (3σ = 4.5) the two would pick different kernel radii and blur differently.
+    var scaled = 3.0 * sigma;
+    var floor = Math.floor(scaled);
+    var fraction = scaled - floor;
+    var rounded = fraction > 0.5 ? floor + 1 : fraction < 0.5 ? floor : floor % 2 === 0 ? floor : floor + 1;
+    var radius = Math.max(1, rounded);
     var kernel = new Float32Array(2 * radius + 1);
     var sum = 0.0;
     for (var i = -radius; i <= radius; i++) {
@@ -622,6 +668,528 @@
       out[i] = (v - lo) * scale;
     }
     return { data: out, rows: plane.rows, cols: plane.cols };
+  }
+
+  /** Port of view3d_relief.unsharp_mask: the film's own detail, added back on top of itself. */
+  function unsharpMask(plane, sigma, strength) {
+    if (!(strength > 0.0)) return { data: Float32Array.from(plane.data), rows: plane.rows, cols: plane.cols };
+    var low = gaussianBlur(plane, Math.max(DETAIL_SIGMA_MIN, sigma * DETAIL_SIGMA_FACTOR));
+    var out = new Float32Array(plane.data.length);
+    for (var i = 0; i < out.length; i++) {
+      var v = plane.data[i] + strength * (plane.data[i] - low.data[i]);
+      out[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    }
+    return { data: out, rows: plane.rows, cols: plane.cols };
+  }
+
+  /** Port of view3d_relief.otsu_threshold: 256 bins over 0..1, the edge above the best split. */
+  function otsuThreshold(values) {
+    var counts = new Float64Array(256);
+    var i, v, bin;
+    for (i = 0; i < values.length; i++) {
+      v = values[i];
+      if (!(v >= 0.0 && v <= 1.0)) continue;   // np.histogram drops anything outside the range
+      bin = Math.floor(v * 256);
+      if (bin > 255) bin = 255;
+      counts[bin] += 1;
+    }
+    var total = 0.0;
+    for (i = 0; i < 256; i++) total += counts[i];
+    if (total <= 0.0) return 0.5;
+    var sumAll = 0.0;
+    for (i = 0; i < 256; i++) sumAll += counts[i] * ((i + 0.5) / 256.0);
+    var weightLow = 0.0, sumLow = 0.0, best = -1.0, bestIndex = -1;
+    for (i = 0; i < 256; i++) {
+      weightLow += counts[i];
+      sumLow += counts[i] * ((i + 0.5) / 256.0);
+      var weightHigh = total - weightLow;
+      if (!(weightLow > 0.0 && weightHigh > 0.0)) continue;
+      var delta = sumLow / weightLow - (sumAll - sumLow) / weightHigh;
+      var variance = weightLow * weightHigh * delta * delta;
+      if (variance > best) { best = variance; bestIndex = i; }
+    }
+    if (bestIndex < 0) return 0.5;
+    return (bestIndex + 1) / 256.0;
+  }
+
+  function meanOfMask(mask) {
+    var hits = 0;
+    for (var i = 0; i < mask.length; i++) if (mask[i]) hits++;
+    return hits / mask.length;
+  }
+
+  function valuesUnder(plane, mask) {
+    var hits = 0, i;
+    for (i = 0; i < mask.length; i++) if (mask[i]) hits++;
+    var out = new Float32Array(hits);
+    var n = 0;
+    for (i = 0; i < mask.length; i++) if (mask[i]) out[n++] = plane.data[i];
+    return out;
+  }
+
+  /** Port of view3d_relief.silhouette_mask: Otsu, with a percentile floor when it finds nothing. */
+  function silhouetteMask(plane) {
+    var data = plane.data;
+    var mask = new Uint8Array(data.length);
+    var cut = otsuThreshold(data);
+    var i;
+    for (i = 0; i < data.length; i++) mask[i] = data[i] >= cut ? 1 : 0;
+    if (meanOfMask(mask) < MASK_MIN_FRACTION) {
+      var sorted = Float64Array.from(data);
+      sorted.sort();
+      cut = percentileSorted(sorted, 100.0 * (1.0 - MASK_MIN_FRACTION));
+      for (i = 0; i < data.length; i++) mask[i] = data[i] >= cut ? 1 : 0;
+    }
+    return { data: mask, rows: plane.rows, cols: plane.cols };
+  }
+
+  /* One row of the exact squared distance transform (the lower envelope of the parabolas
+   * f[q] + (x - q)², Felzenszwalb and Huttenlocher). The desktop walks offsets 1..limit instead;
+   * the two agree once the caller clips at span², because every offset past the limit already
+   * costs more than that. */
+  function squaredEdtRow(f, n, out, v, z) {
+    var k = 0;
+    v[0] = 0;
+    z[0] = -Infinity;
+    z[1] = Infinity;
+    var q, s;
+    for (q = 1; q < n; q++) {
+      s = (f[q] + q * q - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      while (s <= z[k]) {
+        k--;
+        s = (f[q] + q * q - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      }
+      k++;
+      v[k] = q;
+      z[k] = s;
+      z[k + 1] = Infinity;
+    }
+    k = 0;
+    for (q = 0; q < n; q++) {
+      while (z[k + 1] < q) k++;
+      var d = q - v[k];
+      out[q] = d * d + f[v[k]];
+    }
+  }
+
+  /** Port of view3d_relief.distance_transform: how far every set pixel is from the nearest clear
+   *  one, capped at `limit`. Rows first (a clamped chamfer pass), then the exact column envelope. */
+  function distanceTransform(mask, limit) {
+    var rows = mask.rows;
+    var cols = mask.cols;
+    var span = limit;
+    var ceiling = span * span;
+    var near = new Float64Array(rows * cols);
+    var r, c, i;
+    for (i = 0; i < near.length; i++) near[i] = mask.data[i] ? span : 0;
+    for (r = 1; r < rows; r++) {
+      for (c = 0; c < cols; c++) {
+        i = r * cols + c;
+        if (near[i - cols] + 1 < near[i]) near[i] = near[i - cols] + 1;
+      }
+    }
+    for (r = rows - 2; r >= 0; r--) {
+      for (c = 0; c < cols; c++) {
+        i = r * cols + c;
+        if (near[i + cols] + 1 < near[i]) near[i] = near[i + cols] + 1;
+      }
+    }
+    var f = new Float64Array(cols);
+    var line = new Float64Array(cols);
+    var v = new Int32Array(cols);
+    var z = new Float64Array(cols + 1);
+    var out = new Float32Array(rows * cols);
+    for (r = 0; r < rows; r++) {
+      for (c = 0; c < cols; c++) f[c] = near[r * cols + c] * near[r * cols + c];
+      squaredEdtRow(f, cols, line, v, z);
+      for (c = 0; c < cols; c++) {
+        var best = line[c];
+        if (best < 0) best = 0;
+        else if (best > ceiling) best = ceiling;
+        out[r * cols + c] = Math.sqrt(best);
+      }
+    }
+    return { data: out, rows: rows, cols: cols };
+  }
+
+  /** Port of view3d_relief.close_mask: dilate then erode, both by a distance transform. */
+  function closeMask(mask, radius) {
+    if (radius <= 0) return mask;
+    var span = radius + 1;
+    var i;
+    var inverted = new Uint8Array(mask.data.length);
+    for (i = 0; i < inverted.length; i++) inverted[i] = mask.data[i] ? 0 : 1;
+    var away = distanceTransform({ data: inverted, rows: mask.rows, cols: mask.cols }, span);
+    var dilated = new Uint8Array(mask.data.length);
+    for (i = 0; i < dilated.length; i++) dilated[i] = away.data[i] <= radius ? 1 : 0;
+    var inside = distanceTransform({ data: dilated, rows: mask.rows, cols: mask.cols }, span);
+    var out = new Uint8Array(mask.data.length);
+    for (i = 0; i < out.length; i++) out[i] = inside.data[i] > radius ? 1 : 0;
+    return { data: out, rows: mask.rows, cols: mask.cols };
+  }
+
+  /* Port of view3d_relief.max_filter_1d at axis=1, as a running maximum rather than a window read
+   * per pixel: a monotonic queue holds the candidates, so the cost is one pass whatever the width. */
+  function maxFilterCols(plane, width) {
+    var rows = plane.rows;
+    var cols = plane.cols;
+    if (width <= 1) return { data: Float32Array.from(plane.data), rows: rows, cols: cols };
+    var radius = Math.floor(width / 2);
+    var span = cols + 2 * radius;
+    var ext = new Float32Array(span);
+    var queue = new Int32Array(span);
+    var out = new Float32Array(rows * cols);
+    var r, i, head, tail, take, src;
+    for (r = 0; r < rows; r++) {
+      for (i = 0; i < span; i++) {
+        src = i - radius;
+        if (src < 0) src = 0;
+        else if (src >= cols) src = cols - 1;
+        ext[i] = plane.data[r * cols + src];
+      }
+      head = 0;
+      tail = 0;
+      for (i = 0; i < span; i++) {
+        while (tail > head && ext[queue[tail - 1]] <= ext[i]) tail--;
+        queue[tail++] = i;
+        take = i - 2 * radius;
+        if (take >= 0) {
+          while (queue[head] < take) head++;
+          out[r * cols + take] = ext[queue[head]];
+        }
+      }
+    }
+    return { data: out, rows: rows, cols: cols };
+  }
+
+  /** Port of view3d_relief.shift_rows: rows moved by `offset`, the edge rows repeated. */
+  function shiftRows(plane, offset) {
+    if (offset === 0) return plane;
+    var rows = plane.rows;
+    var cols = plane.cols;
+    var out = new Float32Array(rows * cols);
+    for (var r = 0; r < rows; r++) {
+      var src = r - offset;
+      if (src < 0) src = 0;
+      else if (src >= rows) src = rows - 1;
+      out.set(plane.data.subarray(src * cols, src * cols + cols), r * cols);
+    }
+    return { data: out, rows: rows, cols: cols };
+  }
+
+  /** Port of view3d_relief.grey_dilate: a disc of radius `radius`, as stacked shifted row bands. */
+  function greyDilate(plane, radius) {
+    var bands = {};
+    var offset, half, i;
+    for (offset = -radius; offset <= radius; offset++) {
+      half = Math.floor(Math.sqrt(Math.max(0.0, radius * radius - offset * offset)));
+      if (!bands[half]) bands[half] = [];
+      bands[half].push(offset);
+    }
+    var out = null;
+    var keys = Object.keys(bands);
+    for (var k = 0; k < keys.length; k++) {
+      half = Number(keys[k]);
+      var band = maxFilterCols(plane, 2 * half + 1);
+      var offsets = bands[keys[k]];
+      for (var j = 0; j < offsets.length; j++) {
+        var shifted = shiftRows(band, offsets[j]);
+        if (out === null) out = Float32Array.from(shifted.data);
+        else for (i = 0; i < out.length; i++) if (shifted.data[i] > out[i]) out[i] = shifted.data[i];
+      }
+    }
+    if (out === null) out = Float32Array.from(plane.data);
+    return { data: out, rows: plane.rows, cols: plane.cols };
+  }
+
+  /** Port of view3d_relief.grey_close: dilate then erode, so narrow valleys fill in. */
+  function greyClose(plane, radius) {
+    if (radius <= 0) return { data: Float32Array.from(plane.data), rows: plane.rows, cols: plane.cols };
+    var i;
+    var dilated = greyDilate(plane, radius);
+    var negated = new Float32Array(plane.data.length);
+    for (i = 0; i < negated.length; i++) negated[i] = -dilated.data[i];
+    var eroded = greyDilate({ data: negated, rows: plane.rows, cols: plane.cols }, radius);
+    var out = new Float32Array(plane.data.length);
+    for (i = 0; i < out.length; i++) out[i] = -eroded.data[i];
+    return { data: out, rows: plane.rows, cols: plane.cols };
+  }
+
+  function proxyScale(rows, cols) {
+    return Math.max(1, Math.ceil(Math.max(rows, cols) / DOME_TARGET));
+  }
+
+  /** Plain strided decimation: the `[::step, ::step]` the desktop writes everywhere. */
+  function decimate(plane, step) {
+    if (step <= 1) return plane;
+    var rows = Math.ceil(plane.rows / step);
+    var cols = Math.ceil(plane.cols / step);
+    var out = new plane.data.constructor(rows * cols);
+    for (var r = 0; r < rows; r++) {
+      var src = r * step * plane.cols;
+      var dst = r * cols;
+      for (var c = 0; c < cols; c++) out[dst + c] = plane.data[src + c * step];
+    }
+    return { data: out, rows: rows, cols: cols };
+  }
+
+  /** Port of view3d_relief.to_proxy: blur to the proxy's pixel size, then decimate onto it. */
+  function toProxy(plane, step) {
+    if (step <= 1) return { data: Float32Array.from(plane.data), rows: plane.rows, cols: plane.cols };
+    return decimate(gaussianBlur(plane, step * 0.5), step);
+  }
+
+  /** Port of view3d_relief.resample_to: bilinear, corners pinned to corners. */
+  function resampleTo(small, rows, cols) {
+    if (small.rows === rows && small.cols === cols) {
+      return { data: Float32Array.from(small.data), rows: rows, cols: cols };
+    }
+    var out = new Float32Array(rows * cols);
+    var stepY = rows > 1 ? (small.rows - 1) / (rows - 1) : 0;
+    var stepX = cols > 1 ? (small.cols - 1) / (cols - 1) : 0;
+    for (var r = 0; r < rows; r++) {
+      var ry = r * stepY;
+      var y0 = Math.floor(ry);
+      var y1 = Math.min(y0 + 1, small.rows - 1);
+      var fy = ry - y0;
+      for (var c = 0; c < cols; c++) {
+        var rx = c * stepX;
+        var x0 = Math.floor(rx);
+        var x1 = Math.min(x0 + 1, small.cols - 1);
+        var fx = rx - x0;
+        var top = small.data[y0 * small.cols + x0] * (1.0 - fx) + small.data[y0 * small.cols + x1] * fx;
+        var bottom = small.data[y1 * small.cols + x0] * (1.0 - fx) + small.data[y1 * small.cols + x1] * fx;
+        out[r * cols + c] = (1.0 - fy) * top + fy * bottom;
+      }
+    }
+    return { data: out, rows: rows, cols: cols };
+  }
+
+  /** Port of view3d_relief.dome_height: a mask's own distance field, faded and feathered. */
+  function domeHeight(mask, closeFraction) {
+    var rows = mask.rows;
+    var cols = mask.cols;
+    var step = proxyScale(rows, cols);
+    var small = decimate(mask, step);
+    var limit = Math.max(4, Math.min(Math.floor(Math.min(small.rows, small.cols) / 2), DOME_MAX_DISTANCE));
+    if (closeFraction > 0.0) small = closeMask(small, Math.trunc(limit * closeFraction));
+    var distance = distanceTransform(small, limit);
+    var peak = 0.0;
+    var i;
+    for (i = 0; i < distance.data.length; i++) if (distance.data[i] > peak) peak = distance.data[i];
+    if (!(peak > 0.0)) return { data: new Float32Array(rows * cols), rows: rows, cols: cols };
+    var faded = new Float32Array(distance.data.length);
+    for (i = 0; i < faded.length; i++) faded[i] = Math.sqrt(distance.data[i] / peak);
+    var dome = gaussianBlur({ data: faded, rows: small.rows, cols: small.cols }, DOME_BLUR_SIGMA);
+    var solid = new Float32Array(small.data.length);
+    for (i = 0; i < solid.length; i++) solid[i] = small.data[i] ? 1.0 : 0.0;
+    var support = gaussianBlur({ data: solid, rows: small.rows, cols: small.cols }, DOME_SUPPORT_FEATHER);
+    for (i = 0; i < dome.data.length; i++) dome.data[i] *= support.data[i];
+    return resampleTo(dome, rows, cols);
+  }
+
+  /** Port of view3d_relief.bone_support: the cortical bone inside the limb, its canals closed over. */
+  function boneSupport(small) {
+    var limb = silhouetteMask(small);
+    var inside = valuesUnder(small, limb.data);
+    if (inside.length === 0) return null;
+    var cut = otsuThreshold(inside);
+    var bone = new Uint8Array(small.data.length);
+    for (var i = 0; i < bone.length; i++) bone[i] = limb.data[i] && small.data[i] >= cut ? 1 : 0;
+    if (meanOfMask(bone) < MASK_MIN_FRACTION) return null;
+    return closeMask({ data: bone, rows: small.rows, cols: small.cols }, CLOSE_RADIUS);
+  }
+
+  /** Port of view3d_relief.canal_lift: how far a grey closing lifts the field, feathered and gated. */
+  function canalLift(field, support, radius, maxLift, feather) {
+    var closed = greyClose(field, radius);
+    var lift = new Float32Array(field.data.length);
+    var i;
+    for (i = 0; i < lift.length; i++) {
+      var v = closed.data[i] - field.data[i];
+      lift[i] = v < 0 ? 0 : v > maxLift ? maxLift : v;
+    }
+    var solid = new Float32Array(support.data.length);
+    for (i = 0; i < solid.length; i++) solid[i] = support.data[i] ? 1.0 : 0.0;
+    var gate = gaussianBlur({ data: solid, rows: field.rows, cols: field.cols }, feather);
+    var smoothed = gaussianBlur({ data: lift, rows: field.rows, cols: field.cols }, feather);
+    var out = new Float32Array(lift.length);
+    for (i = 0; i < out.length; i++) out[i] = smoothed.data[i] * gate.data[i];
+    return { data: out, rows: field.rows, cols: field.cols };
+  }
+
+  /** Port of view3d_relief.closing_lift: how deep the medullary canal reads as a valley, so the
+   *  shaft can be lifted back out of its own trough. */
+  function closingLift(base) {
+    var step = proxyScale(base.rows, base.cols);
+    var small = toProxy(base, step);
+    var support = boneSupport(small);
+    if (support === null) {
+      return { data: new Float32Array(base.rows * base.cols), rows: base.rows, cols: base.cols };
+    }
+    var lift = canalLift(small, support, CLOSE_RADIUS, CLOSE_MAX_LIFT, CLOSE_FEATHER_SIGMA);
+    return resampleTo(lift, base.rows, base.cols);
+  }
+
+  /** Port of view3d_relief.filled_texture: the canal filled in the texture, its grain untouched. */
+  function filledTexture(detail, base) {
+    var rows = detail.rows;
+    var cols = detail.cols;
+    var step = proxyScale(rows, cols);
+    var support = boneSupport(toProxy(base, step));
+    if (support === null) return { data: Float32Array.from(detail.data), rows: rows, cols: cols };
+    var low = gaussianBlur(detail, TEXTURE_BLUR_SIGMA * step);
+    var lift = canalLift(
+      toProxy(low, step),
+      support,
+      TEXTURE_CLOSE_RADIUS,
+      TEXTURE_MAX_LIFT,
+      TEXTURE_FEATHER_SIGMA
+    );
+    var full = resampleTo(lift, rows, cols);
+    var out = new Float32Array(detail.data.length);
+    for (var i = 0; i < out.length; i++) {
+      // low + lift + (detail - low): the lift lands on the coarse layer, the fine grain rides on top.
+      var v = low.data[i] + full.data[i] + (detail.data[i] - low.data[i]);
+      out[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    }
+    return { data: out, rows: rows, cols: cols };
+  }
+
+  /** Port of view3d_relief.dome_field: half a dome over the limb, half over the bone inside it. */
+  function domeField(base) {
+    var limb = silhouetteMask(base);
+    var dome = domeHeight(limb, 0.0);
+    var i;
+    for (i = 0; i < dome.data.length; i++) dome.data[i] *= LIMB_DOME_WEIGHT;
+    var inside = valuesUnder(base, limb.data);
+    if (inside.length > 0) {
+      var cut = otsuThreshold(inside);
+      var bone = new Uint8Array(base.data.length);
+      for (i = 0; i < bone.length; i++) bone[i] = limb.data[i] && base.data[i] >= cut ? 1 : 0;
+      if (meanOfMask(bone) >= MASK_MIN_FRACTION) {
+        var boneDome = domeHeight({ data: bone, rows: base.rows, cols: base.cols }, BONE_CLOSE_FRACTION);
+        for (i = 0; i < dome.data.length; i++) dome.data[i] += (1.0 - LIMB_DOME_WEIGHT) * boneDome.data[i];
+      }
+    }
+    for (i = 0; i < dome.data.length; i++) {
+      if (dome.data[i] < 0) dome.data[i] = 0;
+      else if (dome.data[i] > 1) dome.data[i] = 1;
+    }
+    return dome;
+  }
+
+  /** Port of view3d_relief.round_height: the canal filled and the limb domed over, blended in by
+   *  `rounding` (0..1). This is what stops a shaft reading as a trough between two cortical rims. */
+  function roundHeight(height, base, rounding) {
+    if (!(rounding > 0.0)) {
+      return { data: Float32Array.from(height.data), rows: height.rows, cols: height.cols };
+    }
+    var lift = closingLift(base);
+    var dome = domeField(base);
+    var out = new Float32Array(height.data.length);
+    for (var i = 0; i < out.length; i++) {
+      var filled = base.data[i] + rounding * lift.data[i];
+      var shape = (1.0 - rounding) * filled + rounding * dome.data[i];
+      var v = shape + (1.0 - rounding) * (height.data[i] - base.data[i]);
+      if (lift.data[i] > CANAL_EPS && v < shape) v = shape;
+      out[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    }
+    return { data: out, rows: height.rows, cols: height.cols };
+  }
+
+  /** The desktop's relief_mesh maths in one call: the height field to warp by, and the texture
+   *  to drape over it. index.html and relief-worker.js both go through here. */
+  function reliefFields(plane, windowRange, resolution, sigma, detailStrength, rounding) {
+    var small = downsample(cropToContent(plane), resolution);
+    var texture = normalize(small, windowRange);
+    var base = gaussianBlur(clipPercentiles(texture), sigma);
+    var height = roundHeight(unsharpMask(base, sigma, detailStrength), base, rounding);
+    return { detail: filledTexture(texture, base), height: height };
+  }
+
+  /** Port of view3d_relief._bracket: the choice for the band `value` falls in. */
+  function bracket(value, thresholds, choices) {
+    var index = 0;
+    while (index < thresholds.length && value >= thresholds[index]) index++;
+    return choices[Math.min(index, choices.length - 1)];
+  }
+
+  function medianOf(values) {
+    var sorted = Float64Array.from(values);
+    sorted.sort();
+    var n = sorted.length;
+    if (n === 0) return 0.0;
+    return n % 2 ? sorted[(n - 1) / 2] : 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
+  }
+
+  /** Port of view3d_relief.relief_statistics: grain, edge energy, canal depth and limb width, all
+   *  measured on the same 256 px crop, so films of any detector size compare. */
+  function reliefStatistics(plane, windowRange) {
+    var small = downsample(cropToContent(plane), AUTO_TARGET);
+    var image = clipPercentiles(normalize(small, windowRange));
+    var blurred = gaussianBlur(image, AUTO_NOISE_SIGMA);
+    var residual = new Float32Array(image.data.length);
+    var i;
+    // Median absolute deviation, not the standard deviation: anatomy's own sharp borders live in
+    // the same residual, and they would read as grain everywhere.
+    for (i = 0; i < residual.length; i++) residual[i] = Math.abs(image.data[i] - blurred.data[i]);
+    var noise = MAD_TO_SIGMA * medianOf(residual);
+    var implied = bracket(noise, AUTO_NOISE_EDGES, AUTO_SMOOTH_CHOICES);
+    var smoothed = gaussianBlur(image, Math.max(implied, AUTO_EDGE_SIGMA));
+    var limb = silhouetteMask(smoothed);
+    var hits = 0;
+    for (i = 0; i < limb.data.length; i++) if (limb.data[i]) hits++;
+    if (hits === 0) return { noise: noise, edge: 0.0, canal: 0.0, width: 0.0 };
+    var rows = smoothed.rows;
+    var cols = smoothed.cols;
+    var edgeSum = 0.0;
+    var r, c, dr, dc;
+    for (r = 0; r < rows; r++) {
+      for (c = 0; c < cols; c++) {
+        i = r * cols + c;
+        if (!limb.data[i]) continue;
+        // np.gradient: central differences inside, one-sided on the border rows and columns.
+        dr = rows === 1 ? 0
+          : r === 0 ? smoothed.data[i + cols] - smoothed.data[i]
+          : r === rows - 1 ? smoothed.data[i] - smoothed.data[i - cols]
+          : 0.5 * (smoothed.data[i + cols] - smoothed.data[i - cols]);
+        dc = cols === 1 ? 0
+          : c === 0 ? smoothed.data[i + 1] - smoothed.data[i]
+          : c === cols - 1 ? smoothed.data[i] - smoothed.data[i - 1]
+          : 0.5 * (smoothed.data[i + 1] - smoothed.data[i - 1]);
+        edgeSum += Math.hypot(dc, dr);
+      }
+    }
+    var lift = closingLift(smoothed);
+    var canalSum = 0.0;
+    for (i = 0; i < lift.data.length; i++) if (limb.data[i]) canalSum += lift.data[i];
+    return {
+      noise: noise,
+      edge: edgeSum / hits,
+      canal: canalSum / hits,
+      width: hits / limb.data.length,
+    };
+  }
+
+  /** Port of view3d_relief.auto_presets: smoothness, detail and rounding read off the film itself.
+   *
+   * Grain sets smoothing, because the blur exists to hold grain out of the surface. Edge energy
+   * sets detail the other way round: a film that is already crisp gets halos from a strong unsharp
+   * mask, a soft one needs the lift — and a grainy film has its detail capped whatever its edges
+   * say, since unsharp masking amplifies exactly what the smoothing just removed. A deep canal on
+   * a wide bone is what rounding is for, so those two set it.
+   */
+  function autoPresets(plane, windowRange) {
+    var stats = reliefStatistics(plane, windowRange);
+    var smooth = bracket(stats.noise, AUTO_NOISE_EDGES, AUTO_SMOOTH_CHOICES);
+    var detail = bracket(-stats.edge, AUTO_EDGE_EDGES, AUTO_DETAIL_CHOICES);
+    if (stats.noise >= AUTO_NOISE_EDGES[AUTO_NOISE_EDGES.length - 1]) {
+      detail = Math.min(detail, AUTO_NOISY_DETAIL_CAP);
+    }
+    var rounding = bracket(stats.canal, AUTO_CANAL_EDGES, AUTO_ROUNDING_CHOICES);
+    if (stats.width < AUTO_THIN_LIMB) rounding = Math.min(rounding, AUTO_THIN_ROUNDING_CAP);
+    return { smooth: smooth, detail: detail, rounding: rounding, stats: stats };
   }
 
   /** Port of view3d_relief.invert_lut: grey ramp fading to its inverse at full strength. */
@@ -1084,6 +1652,25 @@
     cropToContent: cropToContent,
     contentBounds: contentBounds,
     clipPercentiles: clipPercentiles,
+    unsharpMask: unsharpMask,
+    otsuThreshold: otsuThreshold,
+    silhouetteMask: silhouetteMask,
+    distanceTransform: distanceTransform,
+    closeMask: closeMask,
+    greyDilate: greyDilate,
+    greyClose: greyClose,
+    proxyScale: proxyScale,
+    toProxy: toProxy,
+    resampleTo: resampleTo,
+    domeHeight: domeHeight,
+    domeField: domeField,
+    canalLift: canalLift,
+    closingLift: closingLift,
+    filledTexture: filledTexture,
+    roundHeight: roundHeight,
+    reliefFields: reliefFields,
+    reliefStatistics: reliefStatistics,
+    autoPresets: autoPresets,
     invertLut: invertLut,
     orbitPoint: orbitPoint,
     gestureFor: gestureFor,
@@ -1102,6 +1689,11 @@
     RESOLUTION_DEFAULT: RESOLUTION_DEFAULT,
     SMOOTH_PRESETS: SMOOTH_PRESETS,
     SMOOTH_DEFAULT: SMOOTH_DEFAULT,
+    DETAIL_PRESETS: DETAIL_PRESETS,
+    DETAIL_DEFAULT: DETAIL_DEFAULT,
+    ROUNDING_PRESETS: ROUNDING_PRESETS,
+    ROUNDING_DEFAULT: ROUNDING_DEFAULT,
+    AUTO_TOOLTIP: AUTO_TOOLTIP,
     INVERT_PRESETS: INVERT_PRESETS,
     INVERT_DEFAULT: INVERT_DEFAULT,
     CLIP_PERCENTILES: CLIP_PERCENTILES,

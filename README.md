@@ -1,7 +1,9 @@
 # X-ray viewer (iPad)
 
 Offline web viewer for my own elbow radiographs: 2D windowing, measuring, markup, plus an
-intensity relief. No build step, no framework — `index.html`, `viewer-core.js` and
+intensity relief with **Smooth**, **Detail** and **Rounding** presets and an **Auto** button that
+reads all three off the film itself (Rounding is what stops a bone shaft reading as a trough
+between its two bright edges). No build step, no framework — `index.html`, `viewer-core.js` and
 `relief-worker.js` are the app.
 
 **Test on the PC.** `node ipad/test.mjs` parses the real AP film and checks the maths against the

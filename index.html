@@ -233,10 +233,15 @@
       <button id="reliefInvert" aria-pressed="false">Invert</button>
     </div>
     <div class="group">
-      <span style="color:var(--ink-dim);font-size:13px">Detail</span>
+      <span style="color:var(--ink-dim);font-size:13px">Mesh</span>
       <select id="reliefResolution"></select>
       <span style="color:var(--ink-dim);font-size:13px">Smooth</span>
       <select id="reliefSmooth"></select>
+      <span style="color:var(--ink-dim);font-size:13px">Detail</span>
+      <select id="reliefDetail"></select>
+      <span style="color:var(--ink-dim);font-size:13px">Rounding</span>
+      <select id="reliefRounding"></select>
+      <button id="reliefAuto" aria-pressed="false">Auto</button>
       <span style="color:var(--ink-dim);font-size:13px">Strength</span>
       <select id="reliefInvertStrength"></select>
     </div>
@@ -1596,15 +1601,15 @@
 </script>
 
 <script type="module">
-/* Relief tab — reduced port of src/xray_viewer/view3d_relief.py.
+/* Relief tab — port of src/xray_viewer/view3d_relief.py.
  *
- * Pipeline, identical to the desktop at detail=0 / rounding=0 (where its unsharp_mask and
- * round_height are both the identity):
- *     crop_to_content -> downsample -> normalize(window_range) -> clip_percentiles -> gaussian_blur
- *
- * ponytail: no dome field, no canal rounding, no unsharp detail, no auto presets, and the
- * texture is the plain normalised image rather than desktop's filled_texture. Upgrade path is
- * porting dome_field / closing_lift / filled_texture out of view3d_relief.py in that order.
+ * The maths lives in viewer-core.js as XV.reliefFields, in the desktop's own order:
+ *     crop_to_content -> downsample -> normalize(window_range) -> clip_percentiles
+ *       -> gaussian_blur -> unsharp_mask -> round_height (closing_lift + dome_field)
+ *     texture: filled_texture
+ * Rounding is what keeps a humerus shaft from reading as a trough between its two cortical
+ * rims — the medullary canal is darker than the bone around it, so without the canal lift and
+ * the dome the middle of the shaft sinks. Auto reads all three presets off the film itself.
  *
  * ponytail: three.js 0.170.0 ships no UMD build on cdnjs (only three.module.min.js), so this is
  * an ES module with a dynamic import rather than a plain <script> tag, and OrbitControls is not
@@ -1623,6 +1628,8 @@ let renderer = null, scene = null, camera = null, mesh = null;
 let target = [0, 0, 0], radius = 1, elevation = XV.HOME_ELEVATION_DEG, azimuth = XV.HOME_AZIMUTH_DEG;
 let builtFor = null;          // the film a mesh was last built from
 let invertOn = false;
+let autoOn = false;           // Auto: the three presets come from the film, not from the selects
+const autoPicks = new Map();  // film -> {smooth, detail, rounding}; reading them is not cheap
 let needsRender = false;
 let renderStopped = false;    // a lost context or a throw in the loop: stop, do not spam
 
@@ -1631,6 +1638,11 @@ XV.RESOLUTIONS.forEach((r) => el("reliefResolution").add(new Option(r + "²", St
 el("reliefResolution").value = String(XV.RESOLUTION_DEFAULT);
 XV.SMOOTH_PRESETS.forEach(([name, sigma]) => el("reliefSmooth").add(new Option(name, String(sigma))));
 el("reliefSmooth").value = String(XV.SMOOTH_DEFAULT);
+XV.DETAIL_PRESETS.forEach(([name, pct]) => el("reliefDetail").add(new Option(name, String(pct))));
+el("reliefDetail").value = String(XV.DETAIL_DEFAULT);
+XV.ROUNDING_PRESETS.forEach(([name, pct]) => el("reliefRounding").add(new Option(name, String(pct))));
+el("reliefRounding").value = String(XV.ROUNDING_DEFAULT);
+el("reliefAuto").title = XV.AUTO_TOOLTIP;
 XV.INVERT_PRESETS.forEach(([name, pct]) => el("reliefInvertStrength").add(new Option(name, String(pct))));
 el("reliefInvertStrength").value = String(XV.INVERT_DEFAULT);
 
@@ -1670,13 +1682,27 @@ canvas.addEventListener("webglcontextlost", (ev) => {
 
 // ------------------------------------------------------------------ geometry
 
-/** The desktop's height field and its grey texture, for one film at one preset. */
-function reliefFields(film, resolution, sigma) {
+/** The three preset selects, as the numbers the maths wants. */
+function currentPresets() {
+  return {
+    resolution: Number(el("reliefResolution").value),
+    sigma: Number(el("reliefSmooth").value),
+    detail: Number(el("reliefDetail").value),
+    rounding: Number(el("reliefRounding").value),
+  };
+}
+
+/** The desktop's height field and its grey texture, for one film at one set of presets. */
+function reliefFields(film, opts) {
   const full = { data: Float32Array.from(film.pixels), rows: film.rows, cols: film.cols };
-  const small = XV.downsample(XV.cropToContent(full), resolution);
-  const detail = XV.normalize(small, film.windowRange);
-  const height = XV.gaussianBlur(XV.clipPercentiles(detail), sigma);
-  return { detail, height };
+  let { sigma, detail, rounding } = opts;
+  let picks = null;
+  if (opts.auto) {
+    picks = XV.autoPresets(full, film.windowRange);
+    ({ smooth: sigma, detail, rounding } = picks);
+  }
+  const fields = XV.reliefFields(full, film.windowRange, opts.resolution, sigma, detail / 100, rounding / 100);
+  return { detail: fields.detail, height: fields.height, picks };
 }
 
 /* The same fields, computed off the main thread. The heavy passes are seconds of work on a
@@ -1696,22 +1722,23 @@ function ensureWorker() {
   return worker;
 }
 
-function reliefFieldsAsync(film, resolution, sigma) {
+function reliefFieldsAsync(film, opts) {
   const w = ensureWorker();
-  if (!w) return Promise.resolve(reliefFields(film, resolution, sigma));
+  if (!w) return Promise.resolve(reliefFields(film, opts));
   return new Promise((resolve) => {
     const fallback = () => {
       workerBroken = true;
       if (worker) { worker.terminate(); worker = null; }
-      resolve(reliefFields(film, resolution, sigma));
+      resolve(reliefFields(film, opts));
     };
     const onMessage = (ev) => {
       done();
       if (!ev.data || !ev.data.ok) { fallback(); return; }
-      const { rows, cols, detail, height } = ev.data;
+      const { rows, cols, detail, height, picks } = ev.data;
       resolve({
         detail: { data: new Float32Array(detail), rows, cols },
         height: { data: new Float32Array(height), rows, cols },
+        picks: picks || null,
       });
     };
     const onError = () => { done(); fallback(); };
@@ -1724,7 +1751,17 @@ function reliefFieldsAsync(film, resolution, sigma) {
     // A copy of the film's pixels, handed over rather than cloned; the film keeps its own.
     const pixels = Float32Array.from(film.pixels);
     w.postMessage(
-      { pixels: pixels.buffer, rows: film.rows, cols: film.cols, resolution, sigma, windowRange: film.windowRange },
+      {
+        pixels: pixels.buffer,
+        rows: film.rows,
+        cols: film.cols,
+        resolution: opts.resolution,
+        sigma: opts.sigma,
+        detail: opts.detail,
+        rounding: opts.rounding,
+        auto: !!opts.auto,
+        windowRange: film.windowRange,
+      },
       [pixels.buffer]
     );
   });
@@ -1935,9 +1972,16 @@ async function build() {
   setMessage("Building relief…");
   await new Promise((r) => setTimeout(r, 30));   // let the message paint before the blocking work
   try {
-    const resolution = Number(el("reliefResolution").value);
-    const sigma = Number(el("reliefSmooth").value);
-    const { detail, height } = await reliefFieldsAsync(film, resolution, sigma);
+    // Auto never hides what it chose: the picks land on the selects themselves, and reading them
+    // off a film costs a second pipeline, so each film's answer is kept.
+    if (autoOn && autoPicks.has(film)) applyPicks(autoPicks.get(film));
+    const opts = currentPresets();
+    opts.auto = autoOn && !autoPicks.has(film);
+    const { detail, height, picks } = await reliefFieldsAsync(film, opts);
+    if (picks) {
+      autoPicks.set(film, picks);
+      applyPicks(picks);
+    }
     const texture = buildTexture(detail, invertOn ? Number(el("reliefInvertStrength").value) / 100 : 0);
     if (mesh) {
       scene.remove(mesh);
@@ -1958,9 +2002,7 @@ async function build() {
 
 async function retexture() {
   if (!mesh || !builtFor) return;
-  const resolution = Number(el("reliefResolution").value);
-  const sigma = Number(el("reliefSmooth").value);
-  const { detail } = await reliefFieldsAsync(builtFor, resolution, sigma);
+  const { detail } = await reliefFieldsAsync(builtFor, currentPresets());
   const next = buildTexture(detail, invertOn ? Number(el("reliefInvertStrength").value) / 100 : 0);
   if (mesh.material.map) mesh.material.map.dispose();
   mesh.material.map = next;
@@ -1993,7 +2035,29 @@ el("reliefInvert").onclick = () => {
 };
 el("reliefInvertStrength").onchange = retexture;
 el("reliefResolution").onchange = () => { if (builtFor) build(); };
-el("reliefSmooth").onchange = () => { if (builtFor) build(); };
+
+function applyPicks(picks) {
+  el("reliefSmooth").value = String(picks.smooth);
+  el("reliefDetail").value = String(picks.detail);
+  el("reliefRounding").value = String(picks.rounding);
+}
+
+// Choosing any of the three by hand is what leaves Auto: the values it picked stay put.
+function pickedByHand() {
+  if (autoOn) {
+    autoOn = false;
+    el("reliefAuto").setAttribute("aria-pressed", "false");
+  }
+  if (builtFor) build();
+}
+el("reliefSmooth").onchange = pickedByHand;
+el("reliefDetail").onchange = pickedByHand;
+el("reliefRounding").onchange = pickedByHand;
+el("reliefAuto").onclick = () => {
+  autoOn = !autoOn;
+  el("reliefAuto").setAttribute("aria-pressed", String(autoOn));
+  if (autoOn && builtFor) build();
+};
 
 window.XVApp = window.XVApp || {};
 window.XVApp.onFilmChange = function () {

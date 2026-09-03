@@ -1,6 +1,7 @@
 // test.mjs — plain node, no dependencies:  node ipad/test.mjs
-// Parses the real AP elbow film and cross-checks the ported maths against values
-// worked out by hand from src/xray_viewer/measure.py.
+// Parses the real AP elbow film and cross-checks the ported maths against values worked out by
+// hand from src/xray_viewer/measure.py, and — for the relief steps — against numbers printed by
+// src/xray_viewer/view3d_relief.py itself.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -343,6 +344,95 @@ const flat = XV.gaussianBlur({ data: Float32Array.from({ length: 64 }, () => 0.2
 let flatOk = true;
 for (let i = 0; i < flat.data.length; i++) if (Math.abs(flat.data[i] - 0.25) > 1e-6) flatOk = false;
 check("gaussian_blur preserves a constant field", flatOk);
+// ------------------------------------------- relief steps vs the desktop's own numbers
+/* A 32x32 synthetic limb: a bright shaft with a darker canal down the middle of it, which is
+ * exactly the shape that makes a real humerus render as a trough between two cortical rims.
+ * The expected values below came out of the desktop code itself, on this same array:
+ *   uv run --project xray-viewer python -c "...view3d_relief..."   (numpy 2.5.2, 2026-09-03)
+ * They are sampled every 97th pixel, so a wrong pass shows up wherever it went wrong. */
+const SYNTH = 32;
+const synth = { data: new Float32Array(SYNTH * SYNTH), rows: SYNTH, cols: SYNTH };
+for (let r = 0; r < SYNTH; r++) {
+  for (let c = 0; c < SYNTH; c++) {
+    let v = 0.05 + 0.02 * Math.sin(r * 0.7) * Math.cos(c * 0.9);
+    if (c >= 8 && c < 24 && r >= 3 && r < 29) v = 0.85;
+    if (c >= 13 && c < 19 && r >= 5 && r < 27) v = 0.45;
+    synth.data[r * SYNTH + c] = v;
+  }
+}
+const desktop = {
+  otsu: 0.0703125,
+  greyClose: [0.0697089955, 0.0697089955, 0.0697633624, 0.850000024, 0.850000024, 0.850000024, 0.850000024, 0.850000024, 0.850000024, 0.850000024, 0.850000024],
+  closingLift: [0.169002652, 0.142769903, 0.111689858, 0.0899246782, 0.0769093186, 0.0720195249, 0.0757028684, 0.0846706256, 0.0933169648, 0.114159197, 0.152080849],
+  domeField: [0.000115158517, 0.0104340147, 0.0685930848, 0.196020603, 0.373193979, 0.54123044, 0.669752896, 0.753202498, 0.730576515, 0.503949165, 0.393556744],
+  unsharp: [0.0245802067, 0.00343257189, 0, 0.975691855, 0.956773698, 0.943401873, 0.934759438, 0.933578432, 0.428605407, 0.987702131, 0.00213430449],
+  roundHeight: [0.0435953736, 0.0481579378, 0.0799750909, 0.407799304, 0.533509374, 0.655276954, 0.750198841, 0.814172208, 0.677929282, 0.64629221, 0.33703661],
+  filledTexture: [0.24638097, 0.244811445, 0.196061045, 0.986419141, 0.963028014, 0.947307646, 0.942414939, 0.951072276, 0.580493689, 1, 0.249623239],
+  probes: [37, 134, 231, 328, 425, 522, 619, 716, 813, 910, 1007],
+};
+function matchesDesktop(name, got) {
+  let worst = 0;
+  let at = -1;
+  desktop.probes.forEach((index, n) => {
+    const diff = Math.abs(got.data[index] - desktop[name][n]);
+    if (diff > worst) { worst = diff; at = index; }
+  });
+  check(`${name} matches view3d_relief.py`, worst <= 1e-4, `max diff ${worst.toExponential(2)} at pixel ${at}`);
+}
+check("otsu_threshold matches view3d_relief.py", near(XV.otsuThreshold(synth.data), desktop.otsu, 1e-9));
+matchesDesktop("greyClose", XV.greyClose(synth, 5));
+matchesDesktop("closingLift", XV.closingLift(synth));
+matchesDesktop("domeField", XV.domeField(synth));
+const synthUnsharp = XV.unsharpMask(synth, 2.0, 0.3);
+matchesDesktop("unsharp", synthUnsharp);
+matchesDesktop("roundHeight", XV.roundHeight(synthUnsharp, synth, 0.75));
+matchesDesktop("filledTexture", XV.filledTexture(synth, synth));
+
+// the point of the whole thing: the canal is a valley, and closing_lift lifts it and not the rims
+const lift = XV.closingLift(synth);
+const canalMid = lift.data[16 * SYNTH + 16];
+const rimMid = lift.data[16 * SYNTH + 10];
+let liftHigh = 0;
+for (let i = 0; i < lift.data.length; i++) if (lift.data[i] > liftHigh) liftHigh = lift.data[i];
+// The 14 px closing radius is wider than this 32 px toy, so its bone support covers the whole
+// frame and the background lifts too; what the toy can still show is the canal outrunning the rim.
+check(
+  "closing_lift raises the canal above the cortical rim, and never past CLOSE_MAX_LIFT",
+  canalMid > 0.05 && canalMid > rimMid && liftHigh <= 0.18 + 1e-6,
+  `canal ${canalMid.toFixed(4)}, rim ${rimMid.toFixed(4)}, peak ${liftHigh.toFixed(4)}`
+);
+
+// ------------------------------------------------- the whole pipeline on the real film
+const started = Date.now();
+const fields = XV.reliefFields(plane, r.windowRange, 1024, XV.SMOOTH_DEFAULT, XV.DETAIL_DEFAULT / 100, XV.ROUNDING_DEFAULT / 100);
+const elapsed = Date.now() - started;
+let heightOk = true;
+let heightHigh = 0;
+for (let i = 0; i < fields.height.data.length; i++) {
+  const v = fields.height.data[i];
+  if (!(Number.isFinite(v) && v >= 0 && v <= 1)) heightOk = false;
+  if (v > heightHigh) heightHigh = v;
+}
+check(
+  "relief_fields at 1024² is finite in 0..1",
+  heightOk && heightHigh > 0.5,
+  `${fields.height.rows}x${fields.height.cols}, peak ${heightHigh.toFixed(3)}, ${elapsed} ms`
+);
+let textureOk = true;
+for (let i = 0; i < fields.detail.data.length; i++) {
+  const v = fields.detail.data[i];
+  if (!(Number.isFinite(v) && v >= 0 && v <= 1)) textureOk = false;
+}
+check("filled_texture stays in 0..1 on the real film", textureOk);
+const picks = XV.autoPresets(plane, r.windowRange);
+check(
+  "auto_presets picks from the preset tables",
+  XV.SMOOTH_PRESETS.some(([, v]) => v === picks.smooth) &&
+    XV.DETAIL_PRESETS.some(([, v]) => v === picks.detail) &&
+    XV.ROUNDING_PRESETS.some(([, v]) => v === picks.rounding),
+  `smooth=${picks.smooth} detail=${picks.detail} rounding=${picks.rounding}`
+);
+
 const home = XV.orbitPoint([0, 0, 0], 10, 0, 0);
 check("orbit_point at elev 0 / azim 0 looks along -Y", near(home[0], 0, 1e-12) && near(home[1], -10, 1e-12));
 const inv = XV.invertLut(1.0);
