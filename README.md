@@ -6,6 +6,11 @@ reads all three off the film itself (Rounding is what stops a bone shaft reading
 between its two bright edges). No build step, no framework — `index.html`, `viewer-core.js` and
 `relief-worker.js` are the app.
 
+**Relief.** Tap Build, or tap the empty black stage. **Mesh** is the grid size (512² default,
+1024² for detail), **Smooth / Detail / Rounding** match the desktop presets, **Auto** picks all
+three from the film and switches itself off when you change one by hand. One finger orbits, two
+fingers zoom and pan, **Home** resets the view, **Invert** flips the shading.
+
 **Test on the PC.** `node ipad/test.mjs` parses the real AP film and checks the maths against the
 desktop app. To see it: `python -m http.server 8765 --directory ipad`, then open
 <http://localhost:8765/> and pick the `.dcm` files.
@@ -22,13 +27,15 @@ tap **Share → Add to Home Screen**, then **Open** it from the home screen and 
 to pick your `.dcm` files. They are remembered between launches and it works with no signal.
 
 **Moving the image.** Two fingers pan, pinch and twist. One finger pans only when no tool is
-armed; the Pencil never pans. **Lock** freezes the image, **Fit** refits it, **Rotate L/R** turn it.
+armed; the Pencil never pans. **Lock** freezes the image, **Fit** refits it, **Rotate L/R** turn it,
+and **Clear marks** (same row, always on screen) wipes every measurement and markup on this film —
+Undo brings them back.
 
 **Measuring.** Line, Angle (end → corner → end), Cobb (two lines), Circle, Ellipse, Point, Text.
 Tap points with a finger, or draw with the Pencil — one slide makes a whole line or shape. The
 value updates live while placing. Drag any dot to move it; drag the label to move the whole
 mark; tap the label for Delete, angle snap, exact value, or Set as reference. Undo / Redo /
-Undo point / Clear are in the same row.
+Undo point are in the same row.
 
 **Calibrate.** DICOM pixel spacing is used when present. Otherwise (or to override it) tap
 **Calibrate**, draw over something of known size, type its length; the status reads
