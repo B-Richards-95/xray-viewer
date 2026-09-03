@@ -38,6 +38,8 @@
 
   var SPACING_RATIO_BOUNDS = [0.5, 2.0];
   var SPACING_MISSING = "missing";
+  // view2d gesture modes: anything that is not MODE_VIEW places points instead of panning.
+  var MODE_VIEW = "none";
   var MONOCHROME1 = "MONOCHROME1";
 
   var DISTANCE_SUFFIX = "mm (detector plane — uncalibrated)";
@@ -46,6 +48,8 @@
   // view3d_relief.py
   var RELIEF_HEIGHT = 60.0;
   var RESOLUTIONS = [512, 1024];
+  // 512² builds in a fraction of the time of 1024² and is the safe default on an iPad.
+  var RESOLUTION_DEFAULT = 512;
   var CROP_TARGET = 256;
   var CROP_BLUR_SIGMA = 4.0;
   var CROP_THRESHOLD = 0.25;
@@ -395,6 +399,57 @@
       center[0] + radius * Math.cos(e) * Math.sin(a),
       center[1] + radius * -Math.cos(e) * Math.cos(a),
       center[2] + radius * Math.sin(e),
+    ];
+  }
+
+  // ------------------------------------------------- gestures and 2-D xform
+
+  /* One place decides what a pointer is allowed to do, so the canvas handlers never
+   * have to reason about it again:
+   *   measuring/marking up  1 pointer places a point, it never pans
+   *   viewing               1 finger pans, a pen never pans (it would ruin pencil taps)
+   *   two pointers          pan + pinch (+ twist), unless the image is locked
+   *   locked                nothing moves the image, but taps still place points
+   */
+  function gestureFor(pointerType, mode, pointerCount, locked) {
+    if (!(pointerCount > 0)) return "none";
+    if (pointerCount >= 2) return locked ? "none" : "pinch";
+    var measuring = !!mode && mode !== MODE_VIEW;
+    if (measuring) return "place";
+    if (locked) return "none";
+    return pointerType === "pen" ? "none" : "pan";
+  }
+
+  /** Image px -> screen px for xform {scale, tx, ty, rot} (rot in radians, clockwise on screen). */
+  function imageToScreen(p, xform) {
+    var rot = xform.rot || 0;
+    var cos = Math.cos(rot), sin = Math.sin(rot), s = xform.scale;
+    return [
+      s * (cos * p[0] - sin * p[1]) + xform.tx,
+      s * (sin * p[0] + cos * p[1]) + xform.ty,
+    ];
+  }
+
+  /** The exact inverse of imageToScreen. */
+  function screenToImage(p, xform) {
+    var rot = xform.rot || 0;
+    var cos = Math.cos(rot), sin = Math.sin(rot), s = xform.scale;
+    var dx = (p[0] - xform.tx) / s, dy = (p[1] - xform.ty) / s;
+    return [cos * dx + sin * dy, -sin * dx + cos * dy];
+  }
+
+  /** Size of the axis-aligned box a cols x rows image fills once rotated by rot. */
+  function rotatedExtent(cols, rows, rot) {
+    var cos = Math.abs(Math.cos(rot || 0)), sin = Math.abs(Math.sin(rot || 0));
+    return { width: cols * cos + rows * sin, height: cols * sin + rows * cos };
+  }
+
+  /** The [tx, ty] that pins imagePt to screenPt at this scale and rotation. */
+  function translationFixing(imagePt, screenPt, scale, rot) {
+    var cos = Math.cos(rot || 0), sin = Math.sin(rot || 0);
+    return [
+      screenPt[0] - scale * (cos * imagePt[0] - sin * imagePt[1]),
+      screenPt[1] - scale * (sin * imagePt[0] + cos * imagePt[1]),
     ];
   }
 
@@ -768,6 +823,12 @@
     clipPercentiles: clipPercentiles,
     invertLut: invertLut,
     orbitPoint: orbitPoint,
+    gestureFor: gestureFor,
+    imageToScreen: imageToScreen,
+    screenToImage: screenToImage,
+    rotatedExtent: rotatedExtent,
+    translationFixing: translationFixing,
+    MODE_VIEW: MODE_VIEW,
     DISTANCE_SUFFIX: DISTANCE_SUFFIX,
     PIXEL_SUFFIX: PIXEL_SUFFIX,
     KNOWN_VIEWS: KNOWN_VIEWS,
@@ -775,6 +836,7 @@
     RELIEF_HEIGHT: RELIEF_HEIGHT,
     RELIEF_NOTE: RELIEF_NOTE,
     RESOLUTIONS: RESOLUTIONS,
+    RESOLUTION_DEFAULT: RESOLUTION_DEFAULT,
     SMOOTH_PRESETS: SMOOTH_PRESETS,
     SMOOTH_DEFAULT: SMOOTH_DEFAULT,
     INVERT_PRESETS: INVERT_PRESETS,

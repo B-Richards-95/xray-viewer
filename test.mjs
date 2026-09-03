@@ -99,6 +99,53 @@ check("blend_lut(0) is identity", lut0[0] === 0 && lut0[255] === 255);
 check("blend_lut(1) is inverted", lut1[0] === 255 && lut1[255] === 0);
 check("blend_lut(0.5) is flat mid grey", lutH[0] === 128 && lutH[255] === 128);
 
+// -------------------------------------------------------- gesture rules
+// pointerType, mode, pointerCount, locked -> expected gesture
+const gestureTable = [
+  ["pen", "none", 1, false, "none"],       // a pen must never pan, or pencil taps drift
+  ["touch", "none", 1, false, "pan"],
+  ["mouse", "none", 1, false, "pan"],
+  ["pen", "distance", 1, false, "place"],
+  ["touch", "distance", 1, false, "place"], // measuring never pans on one pointer
+  ["touch", "angle", 1, false, "place"],
+  ["touch", "none", 2, false, "pinch"],
+  ["touch", "distance", 2, false, "pinch"],
+  ["touch", "none", 3, false, "pinch"],
+  ["touch", "none", 1, true, "none"],       // locked: the image does not move
+  ["touch", "none", 2, true, "none"],
+  ["pen", "distance", 1, true, "place"],    // locked still places points
+  ["touch", "none", 0, false, "none"],
+];
+let gestureOk = true;
+let gestureBad = "";
+for (const [type, m, n, locked, want] of gestureTable) {
+  const got = XV.gestureFor(type, m, n, locked);
+  if (got !== want) {
+    gestureOk = false;
+    gestureBad += ` ${type}/${m}/${n}/${locked}: ${got}!=${want}`;
+  }
+}
+check("gesture_for table", gestureOk, gestureBad || `${gestureTable.length} rows`);
+
+// ------------------------------------------------------- 2-D transform
+for (const rot of [0, Math.PI / 2, Math.PI, -Math.PI / 2, 0.37]) {
+  const xf = { scale: 2.5, tx: 130, ty: -40, rot };
+  let rtOk = true;
+  for (const p of [[0, 0], [1000, 250], [-13.5, 7.25]]) {
+    const back = XV.screenToImage(XV.imageToScreen(p, xf), xf);
+    if (!near(back[0], p[0], 1e-9) || !near(back[1], p[1], 1e-9)) rtOk = false;
+  }
+  check(`image<->screen round-trip at rot=${rot.toFixed(2)}`, rtOk);
+}
+// a quarter turn sends +x to +y on screen (canvas y is down, so this is clockwise)
+const q = XV.imageToScreen([10, 0], { scale: 1, tx: 0, ty: 0, rot: Math.PI / 2 });
+check("rot 90 sends +x to +y", near(q[0], 0, 1e-9) && near(q[1], 10, 1e-9), `[${q}]`);
+const ext = XV.rotatedExtent(400, 300, Math.PI / 2);
+check("rotated_extent swaps at 90", near(ext.width, 300, 1e-9) && near(ext.height, 400, 1e-9));
+const t = XV.translationFixing([50, 60], [800, 900], 3, 0.4);
+const pinned = XV.imageToScreen([50, 60], { scale: 3, tx: t[0], ty: t[1], rot: 0.4 });
+check("translation_fixing pins the point", near(pinned[0], 800, 1e-9) && near(pinned[1], 900, 1e-9));
+
 // ------------------------------------------------------------ relief maths
 const plane = { data: Float32Array.from(r.pixels), rows: r.rows, cols: r.cols };
 const cropped = XV.cropToContent(plane);

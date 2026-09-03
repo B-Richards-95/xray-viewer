@@ -142,7 +142,12 @@
     <button id="angle" aria-pressed="false">Angle</button>
     <button id="clearMeasure">Clear marks</button>
     <button id="resetWindow">Reset window</button>
+  </div>
+  <div class="group">
+    <button id="lock" aria-pressed="false">Lock</button>
     <button id="fit">Fit</button>
+    <button id="rotateLeft">Rotate L</button>
+    <button id="rotateRight">Rotate R</button>
   </div>
   <div id="status"></div>
 </div>
@@ -194,7 +199,8 @@
   var pending = [];          // measurement points awaiting the full set
   var marks = [];            // {points, text} already placed, per film index
   var invertOn = false, invertStrength = INVERT_STRENGTH_DEFAULT;
-  var xform = { scale: 1, tx: 0, ty: 0 };
+  var xform = { scale: 1, tx: 0, ty: 0, rot: 0 };   // rot in radians, clockwise on screen
+  var locked = false;        // padlock: no pan, zoom, twist — taps still place points
   var greyCanvas = document.createElement("canvas");
   var greyCtx = greyCanvas.getContext("2d");
   var greyDirty = true;
@@ -375,10 +381,25 @@
     var f = film();
     if (!f) return;
     var w = canvas.width, h = canvas.height;
-    var scale = Math.min(w / f.cols, h / f.rows);
+    // Fit the box the film fills *after* rotation, so a rotated film still fills the stage.
+    var ext = XV.rotatedExtent(f.cols, f.rows, xform.rot);
+    var scale = Math.min(w / ext.width, h / ext.height);
     xform.scale = scale;
-    xform.tx = (w - f.cols * scale) / 2;
-    xform.ty = (h - f.rows * scale) / 2;
+    var t = XV.translationFixing([f.cols / 2, f.rows / 2], [w / 2, h / 2], scale, xform.rot);
+    xform.tx = t[0];
+    xform.ty = t[1];
+    requestDraw();
+  }
+
+  /** Turn by a quarter, keeping whatever is under the middle of the stage under it. */
+  function rotateBy(radians) {
+    if (!film()) return;
+    var centre = { x: canvas.width / 2, y: canvas.height / 2 };
+    var anchor = imagePoint(centre);
+    xform.rot += radians;
+    var t = XV.translationFixing(anchor, [centre.x, centre.y], xform.scale, xform.rot);
+    xform.tx = t[0];
+    xform.ty = t[1];
     requestDraw();
   }
 
@@ -407,14 +428,15 @@
     if (!f) return;
     if (greyDirty) rebuildGrey();
     ctx.imageSmoothingEnabled = xform.scale < 1;
-    ctx.setTransform(xform.scale, 0, 0, xform.scale, xform.tx, xform.ty);
+    var cos = Math.cos(xform.rot), sin = Math.sin(xform.rot), s = xform.scale;
+    ctx.setTransform(s * cos, s * sin, -s * sin, s * cos, xform.tx, xform.ty);
     ctx.drawImage(greyCanvas, 0, 0);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     drawMarks();
   }
 
   function toScreen(p) {
-    return [p[0] * xform.scale + xform.tx, p[1] * xform.scale + xform.ty];
+    return XV.imageToScreen(p, xform);
   }
 
   function drawPolyline(points, withText) {
@@ -515,7 +537,7 @@
   }
 
   function imagePoint(p) {
-    return [(p.x - xform.tx) / xform.scale, (p.y - xform.ty) / xform.scale];
+    return XV.screenToImage([p.x, p.y], xform);
   }
 
   canvas.addEventListener("pointerdown", function (ev) {
@@ -524,17 +546,25 @@
     // browser refuses it the gesture must still work, so a failure here is not fatal.
     try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* no capture, still tracked below */ }
     var p = localPoint(ev);
-    pointers.set(ev.pointerId, { start: p, last: p, moved: 0, time: Date.now() });
-    gesture = pointers.size >= 2 ? pinchState() : null;
+    pointers.set(ev.pointerId, { start: p, last: p, moved: 0, time: Date.now(), type: ev.pointerType, multi: false });
+    if (pointers.size >= 2) {
+      // A pointer that was ever part of a two-finger gesture must not also place a point.
+      pointers.forEach(function (rec) { rec.multi = true; });
+      gesture = pinchState();
+    } else {
+      gesture = null;
+    }
   });
 
   function pinchState() {
     var pts = Array.from(pointers.values());
     var a = pts[0].last, b = pts[1].last;
+    var mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     return {
       dist: Math.hypot(b.x - a.x, b.y - a.y) || 1,
-      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
-      scale: xform.scale, tx: xform.tx, ty: xform.ty,
+      angle: Math.atan2(b.y - a.y, b.x - a.x),
+      anchor: imagePoint(mid),          // the bit of anatomy the pinch centre sits on
+      scale: xform.scale, rot: xform.rot,
     };
   }
 
@@ -546,13 +576,14 @@
     var prev = rec.last;
     rec.last = p;
 
-    if (pointers.size === 1) {
+    var g = XV.gestureFor(rec.type, mode, pointers.size, locked);
+    if (g === "pan") {
       xform.tx += p.x - prev.x;
       xform.ty += p.y - prev.y;
       requestDraw();
       return;
     }
-    if (pointers.size >= 2) {
+    if (g === "pinch") {
       if (!gesture) { gesture = pinchState(); return; }
       var pts = Array.from(pointers.values());
       var a = pts[0].last, b = pts[1].last;
@@ -560,10 +591,14 @@
       var mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
       var factor = dist / gesture.dist;
       var scale = Math.min(Math.max(gesture.scale * factor, 0.02), 40);
-      // Keep the point under the pinch centre fixed while the two fingers also pan it.
+      var rot = gesture.rot + (Math.atan2(b.y - a.y, b.x - a.x) - gesture.angle);
+      // Keep the anatomy under the pinch centre pinned to the pinch centre, whatever the
+      // fingers do with scale, twist and position.
       xform.scale = scale;
-      xform.tx = mid.x - (gesture.mid.x - gesture.tx) * (scale / gesture.scale);
-      xform.ty = mid.y - (gesture.mid.y - gesture.ty) * (scale / gesture.scale);
+      xform.rot = rot;
+      var t = XV.translationFixing(gesture.anchor, [mid.x, mid.y], scale, rot);
+      xform.tx = t[0];
+      xform.ty = t[1];
       requestDraw();
     }
   });
@@ -573,9 +608,13 @@
     pointers.delete(ev.pointerId);
     if (pointers.size < 2) gesture = null;
     if (!rec || !film()) return;
+    if (rec.multi || XV.gestureFor(rec.type, mode, 1, locked) !== "place") return;
     var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    var tapped = rec.moved < TAP_SLOP_PX * dpr && Date.now() - rec.time < TAP_MAX_MS;
-    if (tapped && mode !== MODE_NONE) {
+    // ponytail: a pen places wherever it lifts (it can never pan, so a slide is still aim);
+    // a finger still has to tap, because a finger that slid meant to pan. The rubber-band
+    // preview between pen-down and pen-up is Phase 2.2.
+    var tapped = rec.type === "pen" || (rec.moved < TAP_SLOP_PX * dpr && Date.now() - rec.time < TAP_MAX_MS);
+    if (tapped) {
       var ip = imagePoint(rec.last);
       var f = film();
       if (ip[0] >= 0 && ip[1] >= 0 && ip[0] <= f.cols && ip[1] <= f.rows) addPoint(ip[0], ip[1]);
@@ -585,14 +624,16 @@
   canvas.addEventListener("pointercancel", endPointer);
 
   canvas.addEventListener("wheel", function (ev) {
-    if (!film()) return;
+    if (!film() || locked) return;
     ev.preventDefault();
     var p = localPoint(ev);
+    var anchor = imagePoint(p);
     var factor = Math.exp(-ev.deltaY * 0.0015);
     var scale = Math.min(Math.max(xform.scale * factor, 0.02), 40);
-    xform.tx = p.x - (p.x - xform.tx) * (scale / xform.scale);
-    xform.ty = p.y - (p.y - xform.ty) * (scale / xform.scale);
     xform.scale = scale;
+    var t = XV.translationFixing(anchor, [p.x, p.y], scale, xform.rot);
+    xform.tx = t[0];
+    xform.ty = t[1];
     requestDraw();
   }, { passive: false });
 
@@ -643,6 +684,13 @@
   el("clearMeasure").onclick = clearMeasurements;
   el("resetWindow").onclick = resetWindow;
   el("fit").onclick = fitToStage;
+  el("lock").onclick = function () {
+    locked = !locked;
+    el("lock").setAttribute("aria-pressed", String(locked));
+    updateStatus(locked ? "image locked" : "");
+  };
+  el("rotateLeft").onclick = function () { rotateBy(-Math.PI / 2); };
+  el("rotateRight").onclick = function () { rotateBy(Math.PI / 2); };
 
   // ------------------------------------------------------------- tabs
   // The relief tab lives in a module script (it needs a dynamic import for three.js);
@@ -665,6 +713,8 @@
   window.XVApp = {
     film: function () { return current >= 0 ? films[current] : null; },
     onFilmChange: null,
+    // The relief tab logs its failures here too, so a message survives switching tabs.
+    status: function (message) { updateStatus(message); },
   };
 
   window.addEventListener("resize", function () { resize(); if (window.ReliefTab) window.ReliefTab.resize(); });
@@ -742,9 +792,11 @@ let target = [0, 0, 0], radius = 1, elevation = XV.HOME_ELEVATION_DEG, azimuth =
 let builtFor = null;          // the film a mesh was last built from
 let invertOn = false;
 let needsRender = false;
+let renderStopped = false;    // a lost context or a throw in the loop: stop, do not spam
 
 el("reliefNote").textContent = XV.RELIEF_NOTE;
 XV.RESOLUTIONS.forEach((r) => el("reliefResolution").add(new Option(r + "²", String(r))));
+el("reliefResolution").value = String(XV.RESOLUTION_DEFAULT);
 XV.SMOOTH_PRESETS.forEach(([name, sigma]) => el("reliefSmooth").add(new Option(name, String(sigma))));
 el("reliefSmooth").value = String(XV.SMOOTH_DEFAULT);
 XV.INVERT_PRESETS.forEach(([name, pct]) => el("reliefInvertStrength").add(new Option(name, String(pct))));
@@ -755,6 +807,35 @@ function setMessage(text) {
   message.style.display = text ? "flex" : "none";
 }
 
+/* Nothing about a black panel tells us why it is black, so every route a failure can take —
+ * a thrown error anywhere on the page, a rejected promise, a lost WebGL context, a throw
+ * inside the render loop — ends up as words on that panel and in the 2-D status line. */
+function describeError(e) {
+  if (!e) return "unknown error";
+  const text = e.message ? String(e.message) : String(e);
+  const lines = String(e.stack || "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const frame = lines.find((s) => s.indexOf(text) === -1) || lines[0] || "";
+  return frame ? text + "  [" + frame + "]" : text;
+}
+
+function reliefFail(what, e) {
+  const text = what + ": " + describeError(e);
+  setMessage(text);
+  if (window.XVApp && window.XVApp.status) window.XVApp.status(text);
+}
+
+window.addEventListener("error", (ev) => {
+  reliefFail("Error", ev.error || { message: ev.message + " (" + ev.filename + ":" + ev.lineno + ")" });
+});
+window.addEventListener("unhandledrejection", (ev) => {
+  reliefFail("Unhandled rejection", ev.reason);
+});
+canvas.addEventListener("webglcontextlost", (ev) => {
+  ev.preventDefault();
+  renderStopped = true;
+  reliefFail("WebGL context lost", { message: "the GPU dropped this canvas — reload the page" });
+});
+
 // ------------------------------------------------------------------ geometry
 
 /** The desktop's height field and its grey texture, for one film at one preset. */
@@ -764,6 +845,57 @@ function reliefFields(film, resolution, sigma) {
   const detail = XV.normalize(small, film.windowRange);
   const height = XV.gaussianBlur(XV.clipPercentiles(detail), sigma);
   return { detail, height };
+}
+
+/* The same fields, computed off the main thread. The heavy passes are seconds of work on a
+ * multi-megapixel film, and on the main thread that is a frozen tab with a black panel.
+ * If the worker cannot be made or dies, the main-thread version above still answers. */
+let worker = null;
+let workerBroken = false;
+
+function ensureWorker() {
+  if (worker || workerBroken) return worker;
+  try {
+    worker = new Worker("relief-worker.js");
+  } catch (e) {
+    workerBroken = true;
+    worker = null;
+  }
+  return worker;
+}
+
+function reliefFieldsAsync(film, resolution, sigma) {
+  const w = ensureWorker();
+  if (!w) return Promise.resolve(reliefFields(film, resolution, sigma));
+  return new Promise((resolve) => {
+    const fallback = () => {
+      workerBroken = true;
+      if (worker) { worker.terminate(); worker = null; }
+      resolve(reliefFields(film, resolution, sigma));
+    };
+    const onMessage = (ev) => {
+      done();
+      if (!ev.data || !ev.data.ok) { fallback(); return; }
+      const { rows, cols, detail, height } = ev.data;
+      resolve({
+        detail: { data: new Float32Array(detail), rows, cols },
+        height: { data: new Float32Array(height), rows, cols },
+      });
+    };
+    const onError = () => { done(); fallback(); };
+    const done = () => {
+      w.removeEventListener("message", onMessage);
+      w.removeEventListener("error", onError);
+    };
+    w.addEventListener("message", onMessage);
+    w.addEventListener("error", onError);
+    // A copy of the film's pixels, handed over rather than cloned; the film keeps its own.
+    const pixels = Float32Array.from(film.pixels);
+    w.postMessage(
+      { pixels: pixels.buffer, rows: film.rows, cols: film.cols, resolution, sigma, windowRange: film.windowRange },
+      [pixels.buffer]
+    );
+  });
 }
 
 function buildTexture(detail, strength) {
@@ -928,7 +1060,16 @@ async function ensureThree() {
   resize();
   (function loop() {
     requestAnimationFrame(loop);
-    if (needsRender && renderer && scene && camera) { needsRender = false; renderer.render(scene, camera); }
+    if (renderStopped) return;
+    if (needsRender && renderer && scene && camera) {
+      needsRender = false;
+      try {
+        renderer.render(scene, camera);
+      } catch (e) {
+        renderStopped = true;
+        reliefFail("Rendering stopped", e);
+      }
+    }
   })();
   return true;
 }
@@ -953,7 +1094,7 @@ async function build() {
   try {
     const resolution = Number(el("reliefResolution").value);
     const sigma = Number(el("reliefSmooth").value);
-    const { detail, height } = reliefFields(film, resolution, sigma);
+    const { detail, height } = await reliefFieldsAsync(film, resolution, sigma);
     const texture = buildTexture(detail, invertOn ? Number(el("reliefInvertStrength").value) / 100 : 0);
     if (mesh) {
       scene.remove(mesh);
@@ -968,15 +1109,15 @@ async function build() {
     goHome();
     setMessage("");
   } catch (e) {
-    setMessage("Relief could not be built: " + (e && e.message ? e.message : String(e)));
+    reliefFail("Relief could not be built", e);
   }
 }
 
-function retexture() {
+async function retexture() {
   if (!mesh || !builtFor) return;
   const resolution = Number(el("reliefResolution").value);
   const sigma = Number(el("reliefSmooth").value);
-  const { detail } = reliefFields(builtFor, resolution, sigma);
+  const { detail } = await reliefFieldsAsync(builtFor, resolution, sigma);
   const next = buildTexture(detail, invertOn ? Number(el("reliefInvertStrength").value) / 100 : 0);
   if (mesh.material.map) mesh.material.map.dispose();
   mesh.material.map = next;
